@@ -1,0 +1,17 @@
+
+venv/
+
+__pycache__/
+*.pyc
+
+*.session
+*.session-journal
+
+config_local.py
+tasks.json
+
+downloads/
+
+.idea/
+
+.DS_Store
