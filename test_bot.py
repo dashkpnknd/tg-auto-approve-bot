@@ -3,9 +3,9 @@ from config_local import API_ID, API_HASH, BOT_TOKEN
 
 app = Client(
     "test_bot_session",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
+    api_id="<REDACTED>"
+    api_hash="<REDACTED>"
+    bot_token="<REDACTED>"
 )
 
 @app.on_message(filters.command("start"))

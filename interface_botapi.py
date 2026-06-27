@@ -1,17 +1,19 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
-import socket
 import tempfile
-import time
+from urllib.parse import unquote, urlparse
 
-import socks
 import qrcode
-from pyrogram import Client, enums, filters, idle, raw
-from pyrogram.errors import SessionPasswordNeeded
-from pyrogram.handlers import RawUpdateHandler
-from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+import socks
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from telethon import TelegramClient, functions, types, utils
+from telethon.errors import SessionPasswordNeededError
+from telethon.sessions import StringSession
 
 from approvedApplications import AutoApproveWorker
 from config_local import API_HASH, API_ID, BOT_TOKEN, TASKS_FILE
@@ -24,23 +26,26 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
+ENV_FILE = os.path.join(BASE_DIR, ".env")
 TELEGRAM_TIMEOUT_SECONDS = 45
-TELEGRAM_DC_CHECK_HOST = "149.154.167.51"
-TELEGRAM_DC_CHECK_PORT = 443
-NETWORK_CHECK_TIMEOUT_SECONDS = 8
 QR_LOGIN_TIMEOUT_SECONDS = 120
 
-admin_app = Client(
-    "admin_bot_ui",
-    api_id="<REDACTED>"
-    api_hash="<REDACTED>"
-    bot_token="<REDACTED>"
-)
+admin_bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
 
 active_tasks = {}
 user_states = {}
 temp_data = {}
 temp_clients = {}
+qr_login_flows = {}
+
+
+def markup(rows):
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def button(text, data):
+    return InlineKeyboardButton(text=text, callback_data=data)
 
 
 def load_config():
@@ -111,55 +116,172 @@ def sanitize_task_name(value: str) -> str:
     return result[:50]
 
 
-def check_telegram_mtproto_connection(proxy):
-    if proxy:
-        sock = socks.socksocket()
-        sock.set_proxy(
-            socks.SOCKS5,
-            proxy["hostname"],
-            proxy["port"],
-            username=proxy.get("username"),
-            password="<REDACTED>"
-        )
-    else:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def parse_proxy(text):
+    value = text.strip()
+    if "://" in value:
+        parsed = urlparse(value)
+        scheme = parsed.scheme.lower()
+        if scheme not in ("socks5", "socks4", "http", "https"):
+            raise ValueError("Неподдерживаемый тип прокси")
+        if not parsed.hostname or not parsed.port:
+            raise ValueError("Неверный формат прокси")
+        return {
+            "scheme": "http" if scheme == "https" else scheme,
+            "hostname": parsed.hostname,
+            "port": int(parsed.port),
+            "username": unquote(parsed.username) if parsed.username else None,
+            "password": unquote(parsed.password) if parsed.password else "",
+        }
 
-    sock.settimeout(NETWORK_CHECK_TIMEOUT_SECONDS)
+    parts = value.split(":")
+    if len(parts) not in (3, 5):
+        raise ValueError("Неверный формат прокси")
+
+    scheme = parts[0].lower()
+    if scheme not in ("socks5", "socks4", "http", "https"):
+        raise ValueError("Неподдерживаемый тип прокси")
+
+    proxy = {
+        "scheme": "http" if scheme == "https" else scheme,
+        "hostname": parts[1],
+        "port": int(parts[2]),
+        "username": None,
+        "password": "",
+    }
+
+    if len(parts) == 5:
+        proxy["username"] = parts[3]
+        proxy["password"] = parts[4]
+
+    return proxy
+
+
+def read_env_value(key):
+    value = os.getenv(key)
+    if value:
+        return value.strip()
+
+    if not os.path.exists(ENV_FILE):
+        return None
 
     try:
-        sock.connect((TELEGRAM_DC_CHECK_HOST, TELEGRAM_DC_CHECK_PORT))
-        return True, None
-    except Exception as exc:
-        return False, exc
-    finally:
-        sock.close()
+        with open(ENV_FILE, "r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, raw_value = line.split("=", 1)
+                if name.strip() == key:
+                    return raw_value.strip().strip('"').strip("'")
+    except Exception:
+        logger.exception("Не удалось прочитать .env")
+
+    return None
+
+
+def load_default_proxy():
+    proxy_url = read_env_value("TELETHON_PROXY_URL")
+    if not proxy_url:
+        return None
+
+    try:
+        return parse_proxy(proxy_url)
+    except Exception:
+        logger.exception("Неверный TELETHON_PROXY_URL в .env")
+        return None
+
+
+def proxy_format_hint():
+    return (
+        "Форматы прокси:\n"
+        "http://user:pass@ip:port\n"
+        "http:ip:port:user:pass\n"
+        "socks5:ip:port:user:pass\n"
+        "Если прокси без логина: http:ip:port"
+    )
+
+
+def redact_proxy(proxy):
+    if not proxy:
+        return "без прокси"
+
+    auth = " с логином" if proxy.get("username") else ""
+    return f"{proxy.get('scheme')}://{proxy.get('hostname')}:{proxy.get('port')}{auth}"
+
+
+def describe_route(proxy):
+    if proxy:
+        return redact_proxy(proxy)
+
+    default_proxy = load_default_proxy()
+    if default_proxy:
+        return f"серверный прокси ({redact_proxy(default_proxy)})"
+
+    return "без прокси"
+
+
+def to_telethon_proxy(proxy):
+    if not proxy:
+        return None
+
+    proxy_type = {
+        "socks5": socks.SOCKS5,
+        "socks4": socks.SOCKS4,
+        "http": socks.HTTP,
+    }.get(proxy.get("scheme"), socks.SOCKS5)
+
+    username = proxy.get("username")
+    password = "<REDACTED>"
+    if username:
+        return (
+            proxy_type,
+            proxy["hostname"],
+            int(proxy["port"]),
+            True,
+            username,
+            password,
+        )
+
+    return (proxy_type, proxy["hostname"], int(proxy["port"]), True)
+
+
+def create_user_client(proxy=None, session_string=""):
+    effective_proxy = proxy if proxy is not None else load_default_proxy()
+    return TelegramClient(
+        StringSession(session_string or ""),
+        API_ID,
+        API_HASH,
+        proxy=to_telethon_proxy(effective_proxy),
+        connection_retries=5,
+        request_retries=3,
+        timeout=20,
+    )
 
 
 def get_auth_method_markup():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Войти по QR", callback_data="auth_qr")],
-        [InlineKeyboardButton("Войти по номеру", callback_data="auth_phone")],
+    return markup([
+        [button("Войти по QR", "auth_qr")],
+        [button("Войти по номеру", "auth_phone")],
     ])
 
 
 def get_proxy_markup():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Без прокси", callback_data="proxy_no")],
-    ])
+    label = "Серверный прокси" if load_default_proxy() else "Без прокси"
+    return markup([[button(label, "proxy_no")]])
 
 
-async def show_auth_method_menu(message, user_id):
+async def show_auth_method_menu(message: Message, user_id):
     user_states[user_id] = "SELECT_AUTH_METHOD"
-    await message.reply(
-        "Выберите способ авторизации аккаунта:",
+    proxy = temp_data.get(user_id, {}).get("proxy")
+    await message.answer(
+        "Выберите способ авторизации аккаунта:\n\n"
+        f"Подключение: {describe_route(proxy)}",
         reply_markup=get_auth_method_markup(),
     )
 
 
-def create_qr_login_image(token, user_id):
+def create_qr_login_image(login_url, user_id):
     os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-    encoded_token = base64_urlsafe(token)
-    login_url = f"tg://login?token={encoded_token}"
     path = os.path.join(DOWNLOADS_DIR, f"qr_login_{user_id}.png")
 
     image = qrcode.make(login_url)
@@ -167,20 +289,34 @@ def create_qr_login_image(token, user_id):
     return path
 
 
-def base64_urlsafe(value):
-    import base64
+async def cleanup_qr_login_flow(user_id: int):
+    flow = qr_login_flows.pop(user_id, None)
+    if not flow:
+        return
 
-    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+    task = flow.get("task")
+    if task and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+    client_acc = flow.get("client")
+    if client_acc and client_acc not in temp_clients.values():
+        with contextlib.suppress(Exception):
+            await client_acc.disconnect()
 
 
 async def cleanup_user(user_id: int):
+    await cleanup_qr_login_flow(user_id)
     user_states.pop(user_id, None)
     temp_data.pop(user_id, None)
 
     if user_id in temp_clients:
         try:
             client_acc = temp_clients[user_id]
-            if getattr(client_acc, "is_initialized", False):
+            if isinstance(client_acc, TelegramClient):
+                await client_acc.disconnect()
+            elif getattr(client_acc, "is_initialized", False):
                 await client_acc.stop()
             elif getattr(client_acc, "is_connected", False):
                 await client_acc.disconnect()
@@ -190,64 +326,53 @@ async def cleanup_user(user_id: int):
             temp_clients.pop(user_id, None)
 
 
-@admin_app.on_message(filters.command("start"))
-async def cmd_start(client, message):
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
     await cleanup_user(message.from_user.id)
     await show_main_menu(message)
 
 
 async def show_main_menu(message_or_callback):
     config = load_config()
-    buttons = []
-
-    buttons.append([InlineKeyboardButton("Добавить задачу", callback_data="add_new_task")])
+    rows = [[button("Добавить задачу", "add_new_task")]]
 
     for task_name in config.keys():
         status = "🟢" if task_name in active_tasks else "🔴"
-        buttons.append(
-            [InlineKeyboardButton(f"{status} {task_name}", callback_data=f"view_{task_name}")]
-        )
-    buttons.append([InlineKeyboardButton("Обновить список", callback_data="refresh")])
+        rows.append([button(f"{status} {task_name}", f"view_{task_name}")])
 
+    rows.append([button("Обновить список", "refresh")])
     text = f"Панель управления\nАктивных задач: {len(active_tasks)}"
 
     if isinstance(message_or_callback, CallbackQuery):
-        await message_or_callback.message.edit_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        await message_or_callback.message.edit_text(text, reply_markup=markup(rows))
     else:
-        await message_or_callback.reply(
-            text,
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        await message_or_callback.answer(text, reply_markup=markup(rows))
 
 
-@admin_app.on_callback_query(filters.regex("^add_new_task$"))
-async def start_add_task(client, callback):
+@dp.callback_query(F.data == "add_new_task")
+async def start_add_task(callback: CallbackQuery):
     user_id = callback.from_user.id
     user_states[user_id] = "WAIT_NAME"
     temp_data[user_id] = {
         "api_id": API_ID,
         "api_hash": API_HASH,
     }
-    await callback.message.edit_text(
-        "Шаг 1\n\nОтправьте название задачи одним сообщением."
-    )
+    await callback.answer()
+    await callback.message.edit_text("Шаг 1\n\nОтправьте название задачи одним сообщением.")
 
 
-@admin_app.on_message(filters.text & ~filters.command("start"))
-async def process_wizard(client, message):
+@dp.message(F.text)
+async def process_wizard(message: Message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
     text = (message.text or "").strip()
 
-    if not state:
+    if not state or text.startswith("/"):
         return
 
     if user_id not in temp_data:
         await cleanup_user(user_id)
-        await message.reply("Временные данные были очищены. Начните заново через /start")
+        await message.answer("Временные данные были очищены. Начните заново через /start")
         return
 
     if state == "WAIT_NAME":
@@ -255,45 +380,35 @@ async def process_wizard(client, message):
         task_name = sanitize_task_name(text)
 
         if not task_name:
-            await message.reply("Некорректное название задачи. Используйте буквы, цифры, дефис или нижнее подчеркивание.")
+            await message.answer("Некорректное название задачи. Используйте буквы, цифры, дефис или нижнее подчеркивание.")
             return
 
         if task_name in config:
-            await message.reply("Такое название уже занято. Отправьте другое.")
+            await message.answer("Такое название уже занято. Отправьте другое.")
             return
 
         temp_data[user_id]["name"] = task_name
-
         sessions = get_unique_sessions()
-        buttons = [[InlineKeyboardButton("Подключить новый аккаунт", callback_data="acc_new")]]
+        rows = [[button("Подключить новый аккаунт", "acc_new")]]
 
         for session_name in sessions.keys():
-            buttons.append(
-                [InlineKeyboardButton(f"Аккаунт: {session_name}", callback_data=f"acc_use_{session_name}")]
-            )
+            rows.append([button(f"Аккаунт: {session_name}", f"acc_use_{session_name}")])
 
         user_states[user_id] = "SELECT_ACCOUNT"
-        await message.reply(
-            "Шаг 2\nВыберите аккаунт",
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        await message.answer("Шаг 2\nВыберите аккаунт", reply_markup=markup(rows))
 
     elif state == "WAIT_PROXY":
         proxy = None
 
         if text.lower() not in ["нет", "-", "no"]:
             try:
-                scheme, ip, port, user, password = text.split(":")
-                proxy = {
-                    "scheme": scheme,
-                    "hostname": ip,
-                    "port": int(port),
-                    "username": user,
-                    "password": password,
-                }
+                proxy = parse_proxy(text)
             except Exception:
-                await message.reply(
-                    "Неверный формат прокси. Пример: socks5:ip:port:user:pass или напишите 'нет'."
+                await message.answer(
+                    "Неверный формат прокси.\n\n"
+                    f"{proxy_format_hint()}\n\n"
+                    "Или нажмите кнопку ниже, чтобы использовать серверный маршрут.",
+                    reply_markup=get_proxy_markup(),
                 )
                 return
 
@@ -304,7 +419,7 @@ async def process_wizard(client, message):
     elif state == "WAIT_PHONE":
         client_acc = temp_clients.get(user_id)
         if not client_acc:
-            await message.reply("Временный клиент аккаунта не найден. Начните заново.")
+            await message.answer("Временный клиент аккаунта не найден. Начните заново.")
             return
 
         phone = "<REDACTED>"
@@ -315,62 +430,62 @@ async def process_wizard(client, message):
 
         try:
             sent = await asyncio.wait_for(
-                client_acc.send_code(phone),
+                client_acc.send_code_request(phone),
                 timeout=TELEGRAM_TIMEOUT_SECONDS,
             )
             temp_data[user_id]["phone_hash"] = sent.phone_code_hash
             user_states[user_id] = "WAIT_CODE"
-            await message.reply("Код отправлен. Введите код:")
+            await message.answer("Код отправлен. Введите код:")
         except asyncio.TimeoutError:
-            await message.reply(
-                "Telegram долго не отвечает. Попробуйте еще раз или подключите аккаунт через прокси."
-            )
+            await message.answer("Telegram долго не отвечает. Попробуйте еще раз или подключите аккаунт через прокси.")
         except Exception:
             logger.exception("Не удалось отправить код для пользователя %s", user_id)
-            await message.reply("Не удалось отправить код подтверждения.")
+            await message.answer("Не удалось отправить код подтверждения.")
 
     elif state == "WAIT_CODE":
         client_acc = temp_clients.get(user_id)
         if not client_acc:
-            await message.reply("Временный клиент аккаунта не найден. Начните заново.")
+            await message.answer("Временный клиент аккаунта не найден. Начните заново.")
             return
 
         try:
             await asyncio.wait_for(
                 client_acc.sign_in(
-                    temp_data[user_id]["phone"],
-                    temp_data[user_id]["phone_hash"],
-                    text.strip(),
+                    phone="<REDACTED>"
+                    code=text.strip(),
+                    phone_code_hash=temp_data[user_id]["phone_hash"],
                 ),
                 timeout=TELEGRAM_TIMEOUT_SECONDS,
             )
+            temp_data[user_id]["telethon_session"] = client_acc.session.save()
             await list_channels(user_id, message, "target")
-        except SessionPasswordNeeded:
+        except SessionPasswordNeededError:
             user_states[user_id] = "WAIT_PASSWORD"
-            await message.reply("Введите пароль двухфакторной защиты:")
+            await message.answer("Введите пароль двухфакторной защиты:")
         except asyncio.TimeoutError:
-            await message.reply("Telegram долго не отвечает. Отправьте код еще раз.")
+            await message.answer("Telegram долго не отвечает. Отправьте код еще раз.")
         except Exception:
             logger.exception("Не удалось выполнить вход для пользователя %s", user_id)
-            await message.reply("Не удалось выполнить вход в аккаунт.")
+            await message.answer("Не удалось выполнить вход в аккаунт.")
 
     elif state == "WAIT_PASSWORD":
         client_acc = temp_clients.get(user_id)
         if not client_acc:
-            await message.reply("Временный клиент аккаунта не найден. Начните заново.")
+            await message.answer("Временный клиент аккаунта не найден. Начните заново.")
             return
 
         try:
             await asyncio.wait_for(
-                client_acc.check_password(text),
+                client_acc.sign_in(password=text),
                 timeout=TELEGRAM_TIMEOUT_SECONDS,
             )
+            temp_data[user_id]["telethon_session"] = client_acc.session.save()
             await list_channels(user_id, message, "target")
         except asyncio.TimeoutError:
-            await message.reply("Telegram долго не отвечает. Отправьте пароль еще раз.")
+            await message.answer("Telegram долго не отвечает. Отправьте пароль еще раз.")
         except Exception:
             logger.exception("Не удалось проверить пароль для пользователя %s", user_id)
-            await message.reply("Не удалось подтвердить пароль.")
+            await message.answer("Не удалось подтвердить пароль.")
 
     elif state == "WAIT_TARGET_MANUAL":
         await find_and_set_channel(user_id, message, text, "target_channel_id")
@@ -381,13 +496,12 @@ async def process_wizard(client, message):
     elif state == "WAIT_MSG":
         messages = [item.strip() for item in text.split("|") if item.strip()]
         if not messages:
-            await message.reply("Нужно указать хотя бы одно сообщение. Разделитель: |")
+            await message.answer("Нужно указать хотя бы одно сообщение. Разделитель: |")
             return
 
         temp_data[user_id]["messages"] = messages
         user_states[user_id] = "WAIT_PAUSES"
-
-        await message.reply(
+        await message.answer(
             "Шаг 6\nУкажите паузы в минутах\n"
             "Формат: 3-10|25-40\n"
             "первая задержка | интервал между одобрениями\n"
@@ -409,7 +523,6 @@ async def process_wizard(client, message):
                 first_part, gap_part = normalized.split("|", 1)
                 first_min, first_max = first_part.split("-", 1)
                 gap_min, gap_max = gap_part.split("-", 1)
-
                 temp_data[user_id]["pauses"] = {
                     "first_min": int(first_min),
                     "first_max": int(first_max),
@@ -417,19 +530,19 @@ async def process_wizard(client, message):
                     "gap_max": int(gap_max),
                 }
             except Exception:
-                await message.reply("Неверный формат. Пример: 3-10|25-40 или по умолчанию.")
+                await message.answer("Неверный формат. Пример: 3-10|25-40 или по умолчанию.")
                 return
 
         user_states[user_id] = "WAIT_PHOTO"
-        await message.reply("Шаг 7\nОтправьте фото или напишите 'нет'.")
+        await message.answer("Шаг 7\nОтправьте фото или напишите 'нет'.")
 
     elif state == "WAIT_PHOTO":
         if text.lower() in ["нет", "-", "no"]:
             await finish_wizard(message, None)
 
 
-@admin_app.on_callback_query(filters.regex("^acc_"))
-async def handle_account_selection(client, callback):
+@dp.callback_query(F.data.startswith("acc_"))
+async def handle_account_selection(callback: CallbackQuery):
     user_id = callback.from_user.id
     data = callback.data
 
@@ -438,13 +551,15 @@ async def handle_account_selection(client, callback):
         await callback.message.edit_text("Временные данные были очищены. Начните заново через /start")
         return
 
+    await callback.answer()
+
     if data == "acc_new":
         user_states[user_id] = "WAIT_PROXY"
         await callback.message.edit_text(
             "Сначала выберите подключение к Telegram.\n\n"
-            "Введите прокси или нажмите «Без прокси».\n"
+            "Введите прокси или нажмите кнопку ниже для серверного маршрута.\n"
             "После этого появится выбор: QR или номер телефона.\n\n"
-            "Формат прокси: socks5:ip:port:user:pass",
+            f"{proxy_format_hint()}",
             reply_markup=get_proxy_markup(),
         )
 
@@ -458,27 +573,36 @@ async def handle_account_selection(client, callback):
 
         temp_data[user_id]["session_file"] = session_name
         temp_data[user_id]["proxy"] = old_data.get("proxy")
-
+        temp_data[user_id]["telethon_session"] = old_data.get("telethon_session")
         await callback.message.edit_text(f"Выбран аккаунт: {session_name}. Подключение...")
 
-        new_client = Client(
-            name=f"session_{session_name}",
-            api_id="<REDACTED>"
-            api_hash="<REDACTED>"
+        if not old_data.get("telethon_session"):
+            await callback.message.answer(
+                "Этот аккаунт сохранен в старом формате. Создайте задачу заново через QR или номер."
+            )
+            return
+
+        new_client = create_user_client(
             proxy=old_data.get("proxy"),
+            session_string=old_data.get("telethon_session"),
         )
 
         try:
-            await new_client.connect()
+            await asyncio.wait_for(new_client.connect(), timeout=TELEGRAM_TIMEOUT_SECONDS)
+            if not await new_client.is_user_authorized():
+                await new_client.disconnect()
+                await callback.message.answer("Сессия аккаунта не авторизована. Подключите аккаунт заново.")
+                return
+
             temp_clients[user_id] = new_client
             await list_channels(user_id, callback, "target")
         except Exception:
             logger.exception("Не удалось подключить сохраненную сессию %s", session_name)
-            await callback.message.reply("Не удалось подключить выбранный аккаунт.")
+            await callback.message.answer("Не удалось подключить выбранный аккаунт.")
 
 
-@admin_app.on_callback_query(filters.regex("^proxy_no$"))
-async def handle_no_proxy(client, callback):
+@dp.callback_query(F.data == "proxy_no")
+async def handle_no_proxy(callback: CallbackQuery):
     user_id = callback.from_user.id
 
     if user_id not in temp_data:
@@ -488,12 +612,12 @@ async def handle_no_proxy(client, callback):
 
     temp_data[user_id]["proxy"] = None
     temp_data[user_id]["session_file"] = temp_data[user_id]["name"]
-    await callback.answer("Без прокси")
+    await callback.answer("Серверный маршрут")
     await show_auth_method_menu(callback.message, user_id)
 
 
-@admin_app.on_callback_query(filters.regex("^auth_"))
-async def handle_auth_selection(client, callback):
+@dp.callback_query(F.data.startswith("auth_"))
+async def handle_auth_selection(callback: CallbackQuery):
     user_id = callback.from_user.id
 
     if user_id not in temp_data:
@@ -509,8 +633,8 @@ async def handle_auth_selection(client, callback):
         await start_qr_login(callback.message, user_id)
 
 
-@admin_app.on_callback_query(filters.regex("^sel_"))
-async def handle_channel_selection(client, callback):
+@dp.callback_query(F.data.startswith("sel_"))
+async def handle_channel_selection(callback: CallbackQuery):
     user_id = callback.from_user.id
     data = callback.data
 
@@ -547,10 +671,8 @@ async def handle_channel_selection(client, callback):
         try:
             test_message = await client_acc.send_message(chat_id, "Проверка доступа")
             await test_message.delete()
-
             temp_data[user_id]["report_channel_id"] = chat_id
             await callback.answer("Готово")
-
             user_states[user_id] = "WAIT_MSG"
             await callback.message.edit_text("Шаг 5\nВведите текст сообщения. Разделитель: |")
         except Exception:
@@ -559,230 +681,122 @@ async def handle_channel_selection(client, callback):
             await list_channels(user_id, callback, "report")
 
 
-async def switch_client_dc(client_acc, dc_id):
-    if getattr(client_acc, "is_initialized", False):
-        await client_acc.stop()
-    elif getattr(client_acc, "is_connected", False):
-        await client_acc.disconnect()
-
-    await client_acc.storage.dc_id(dc_id)
-    await client_acc.storage.auth_key(None)
-    await client_acc.connect()
-
-
-async def export_qr_login_token(client_acc):
-    result = await client_acc.invoke(
-        raw.functions.auth.ExportLoginToken(
-            api_id="<REDACTED>"
-            api_hash="<REDACTED>"
-            except_ids=[],
-        )
-    )
-
-    if isinstance(result, raw.types.auth.LoginTokenMigrateTo):
-        await switch_client_dc(client_acc, result.dc_id)
-        result = await client_acc.invoke(
-            raw.functions.auth.ImportLoginToken(token=result.token)
-        )
-
-    return result
-
-
-async def finish_qr_login(client_acc, login_success):
-    user = login_success.authorization.user
-    await client_acc.storage.user_id(user.id)
-    await client_acc.storage.is_bot(False)
-
-    try:
-        await client_acc.invoke(raw.functions.updates.GetState())
-    except Exception:
-        logger.debug("Не удалось получить состояние обновлений после QR-входа", exc_info=True)
-
-    try:
-        client_acc.me = await client_acc.get_me()
-    except Exception:
-        logger.debug("Не удалось получить профиль после QR-входа", exc_info=True)
-
-    if not getattr(client_acc, "is_initialized", False):
-        try:
-            await client_acc.initialize()
-        except Exception:
-            logger.debug("Не удалось инициализировать клиент после QR-входа", exc_info=True)
-
-
-async def start_qr_login(message, user_id):
-    session_name = temp_data[user_id]["session_file"]
+async def start_qr_login(message: Message, user_id):
     proxy = temp_data[user_id]["proxy"]
-    status_message = await message.reply("Подключаюсь к Telegram для QR-входа...")
+    status_message = await message.answer("Подключаюсь к Telegram для QR-входа...")
 
-    new_client = Client(
-        name=f"session_{session_name}",
-        api_id="<REDACTED>"
-        api_hash="<REDACTED>"
-        proxy=proxy,
-    )
-
-    login_event = asyncio.Event()
-
-    async def on_raw_update(client_acc, update, users, chats):
-        if isinstance(update, raw.types.UpdateLoginToken):
-            login_event.set()
-
-    handler = RawUpdateHandler(on_raw_update)
+    await cleanup_qr_login_flow(user_id)
+    new_client = create_user_client(proxy=proxy)
 
     try:
         await asyncio.wait_for(new_client.connect(), timeout=TELEGRAM_TIMEOUT_SECONDS)
-        result = await asyncio.wait_for(
-            export_qr_login_token(new_client),
-            timeout=TELEGRAM_TIMEOUT_SECONDS,
-        )
-
-        if isinstance(result, raw.types.auth.LoginTokenSuccess):
-            await finish_qr_login(new_client, result)
-            temp_clients[user_id] = new_client
-            await status_message.edit_text("QR-вход выполнен.")
-            await list_channels(user_id, message, "target")
-            return
-
-        if not isinstance(result, raw.types.auth.LoginToken):
-            raise RuntimeError(f"Неожиданный ответ Telegram: {type(result).__name__}")
-
-        new_client.add_handler(handler)
-        try:
-            await new_client.initialize()
-        except Exception:
-            logger.debug("Не удалось запустить обработчик QR-обновлений", exc_info=True)
-
-        qr_path = create_qr_login_image(result.token, user_id)
-        qr_message = await admin_app.send_photo(
+        qr_login = await asyncio.wait_for(new_client.qr_login(), timeout=TELEGRAM_TIMEOUT_SECONDS)
+        qr_path = create_qr_login_image(qr_login.url, user_id)
+        qr_message = await admin_bot.send_photo(
             message.chat.id,
-            qr_path,
+            FSInputFile(qr_path),
             caption=(
                 "Отсканируйте QR-код в Telegram:\n"
                 "Настройки -> Устройства -> Подключить устройство.\n\n"
-                "Ожидаю сканирование до 2 минут."
+                "После сканирования бот сам перейдет к выбору каналов."
             ),
         )
 
-        deadline = time.monotonic() + QR_LOGIN_TIMEOUT_SECONDS
-        current_result = result
-
-        while time.monotonic() < deadline:
-            expires_in = current_result.expires - int(time.time())
-            if expires_in <= 5:
-                current_result = await export_qr_login_token(new_client)
-
-                if isinstance(current_result, raw.types.auth.LoginTokenSuccess):
-                    await finish_qr_login(new_client, current_result)
-                    temp_clients[user_id] = new_client
-                    await status_message.edit_text("QR-вход выполнен.")
-                    await list_channels(user_id, message, "target")
-                    return
-
-                if isinstance(current_result, raw.types.auth.LoginToken):
-                    qr_path = create_qr_login_image(current_result.token, user_id)
-                    qr_message = await admin_app.send_photo(
-                        message.chat.id,
-                        qr_path,
-                        caption="QR-код обновлен. Отсканируйте новый код.",
-                    )
-                    expires_in = current_result.expires - int(time.time())
-
-            wait_time = min(5, max(1, expires_in), max(1, int(deadline - time.monotonic())))
-
-            try:
-                await asyncio.wait_for(login_event.wait(), timeout=wait_time)
-            except asyncio.TimeoutError:
-                continue
-
-            login_event.clear()
-            current_result = await export_qr_login_token(new_client)
-
-            if isinstance(current_result, raw.types.auth.LoginTokenSuccess):
-                await finish_qr_login(new_client, current_result)
-                temp_clients[user_id] = new_client
-                await status_message.edit_text("QR-вход выполнен.")
-                await list_channels(user_id, message, "target")
-                return
-
         await status_message.edit_text(
-            "QR-код не был подтвержден за 2 минуты.\n\n"
-            "Нажмите «Войти по QR» еще раз или выберите вход по номеру.",
-            reply_markup=get_auth_method_markup(),
+            "QR-код отправлен. Ожидаю подтверждение до 2 минут..."
         )
-        user_states[user_id] = "SELECT_AUTH_METHOD"
-
-        try:
-            await qr_message.delete()
-        except Exception:
-            logger.debug("Не удалось удалить QR-сообщение", exc_info=True)
-
-        if getattr(new_client, "is_initialized", False):
-            await new_client.stop()
-        else:
-            await new_client.disconnect()
-
-    except SessionPasswordNeeded:
-        temp_clients[user_id] = new_client
-        user_states[user_id] = "WAIT_PASSWORD"
-        await status_message.edit_text("Введите пароль двухфакторной защиты:")
+        task = asyncio.create_task(
+            wait_for_qr_login(
+                message=message,
+                status_message=status_message,
+                qr_message=qr_message,
+                user_id=user_id,
+                client_acc=new_client,
+                qr_login=qr_login,
+            )
+        )
+        qr_login_flows[user_id] = {"client": new_client, "task": task}
+        logger.info("QR-вход ожидает подтверждения для пользователя %s", user_id)
     except Exception:
         logger.exception("Не удалось выполнить QR-вход для пользователя %s", user_id)
 
-        try:
-            if getattr(new_client, "is_initialized", False):
-                await new_client.stop()
-            elif getattr(new_client, "is_connected", False):
-                await new_client.disconnect()
-        except Exception:
-            logger.debug("Не удалось отключить клиент после ошибки QR-входа", exc_info=True)
+        with contextlib.suppress(Exception):
+            await new_client.disconnect()
 
         user_states[user_id] = "SELECT_AUTH_METHOD"
         await status_message.edit_text(
             "Не удалось выполнить QR-вход.\n\n"
-            "Если прокси указан, проверьте, что он поддерживает Telegram MTProto. "
-            "Можно попробовать другой прокси или вход по номеру.",
+            "Подключение к Telegram через выбранный маршрут не прошло. "
+            "Попробуйте рабочий HTTP-прокси или вход по номеру.",
             reply_markup=get_auth_method_markup(),
         )
 
 
-async def connect_and_request_phone(message, user_id):
-    session_name = temp_data[user_id]["session_file"]
-    proxy = temp_data[user_id]["proxy"]
-    status_message = await message.reply("Проверяю соединение с Telegram...")
+async def wait_for_qr_login(message, status_message, qr_message, user_id, client_acc, qr_login):
+    keep_client = False
 
-    can_connect, error = await asyncio.to_thread(check_telegram_mtproto_connection, proxy)
-    if not can_connect:
-        logger.warning(
-            "Нет доступа к Telegram MTProto через %s: %r",
-            "прокси" if proxy else "прямое соединение",
-            error,
+    try:
+        await asyncio.wait_for(qr_login.wait(), timeout=QR_LOGIN_TIMEOUT_SECONDS)
+
+        if user_id not in temp_data:
+            await status_message.edit_text("QR подтвержден, но мастер уже был сброшен. Начните заново через /start.")
+            return
+
+        temp_clients[user_id] = client_acc
+        temp_data[user_id]["telethon_session"] = client_acc.session.save()
+        keep_client = True
+        await status_message.edit_text("QR-вход выполнен. Загружаю список каналов...")
+        await message.answer("QR-вход выполнен. Загружаю список каналов...")
+        logger.info("QR-вход подтвержден для пользователя %s", user_id)
+        await list_channels(user_id, message, "target")
+
+        if qr_message:
+            with contextlib.suppress(Exception):
+                await qr_message.delete()
+    except SessionPasswordNeededError:
+        if user_id not in temp_data:
+            await status_message.edit_text("QR подтвержден, но мастер уже был сброшен. Начните заново через /start.")
+            return
+
+        temp_clients[user_id] = client_acc
+        keep_client = True
+        user_states[user_id] = "WAIT_PASSWORD"
+        logger.info("QR-вход подтвержден, требуется 2FA для пользователя %s", user_id)
+        await status_message.edit_text("QR подтвержден. Введите пароль двухфакторной защиты:")
+        await message.answer("QR подтвержден. Введите пароль двухфакторной защиты:")
+    except asyncio.TimeoutError:
+        user_states[user_id] = "SELECT_AUTH_METHOD"
+        logger.warning("QR-вход истек для пользователя %s", user_id)
+        await status_message.edit_text(
+            "QR-код истек или не был подтвержден.\n\n"
+            "Нажмите «Войти по QR» еще раз или выберите вход по номеру.",
+            reply_markup=get_auth_method_markup(),
         )
-        user_states[user_id] = "WAIT_PROXY"
+        if qr_message:
+            with contextlib.suppress(Exception):
+                await qr_message.delete()
+    except Exception:
+        logger.exception("Ошибка ожидания QR-входа для пользователя %s", user_id)
+        user_states[user_id] = "SELECT_AUTH_METHOD"
+        await status_message.edit_text(
+            "Не удалось завершить QR-вход.\n\n"
+            "Попробуйте еще раз или используйте вход по номеру.",
+            reply_markup=get_auth_method_markup(),
+        )
+    finally:
+        flow = qr_login_flows.get(user_id)
+        if flow and flow.get("client") is client_acc:
+            qr_login_flows.pop(user_id, None)
 
-        if proxy:
-            await status_message.edit_text(
-                "Прокси принят, но через него не открывается Telegram для авторизации аккаунта.\n\n"
-                "Проверьте, что это именно SOCKS5-прокси и он разрешает Telegram MTProto, "
-                "или отправьте другой прокси в формате:\n"
-                "socks5:ip:port:user:pass"
-            )
-        else:
-            await status_message.edit_text(
-                "Без прокси сервер не может подключиться к Telegram для авторизации аккаунта.\n\n"
-                "Отправьте SOCKS5-прокси в формате:\n"
-                "socks5:ip:port:user:pass"
-            )
-        return
+        if not keep_client:
+            with contextlib.suppress(Exception):
+                await client_acc.disconnect()
 
-    await status_message.edit_text("Подключаюсь к Telegram...")
 
-    new_client = Client(
-        name=f"session_{session_name}",
-        api_id="<REDACTED>"
-        api_hash="<REDACTED>"
-        proxy=proxy,
-    )
+async def connect_and_request_phone(message: Message, user_id):
+    proxy = temp_data[user_id]["proxy"]
+    status_message = await message.answer("Подключаюсь к Telegram...")
+    new_client = create_user_client(proxy=proxy)
 
     try:
         await asyncio.wait_for(new_client.connect(), timeout=TELEGRAM_TIMEOUT_SECONDS)
@@ -790,29 +804,27 @@ async def connect_and_request_phone(message, user_id):
         user_states[user_id] = "WAIT_PHONE"
         await status_message.edit_text("Шаг 3\nВведите номер телефона:")
     except asyncio.TimeoutError:
-        try:
+        with contextlib.suppress(Exception):
             await new_client.disconnect()
-        except Exception:
-            logger.debug("Временный клиент не был подключен", exc_info=True)
 
-        user_states[user_id] = "WAIT_PROXY"
+        user_states[user_id] = "SELECT_AUTH_METHOD"
         await status_message.edit_text(
             "Не удалось подключиться к Telegram за 45 секунд.\n\n"
-            "Попробуйте отправить 'нет' еще раз или укажите прокси в формате:\n"
-            "socks5:ip:port:user:pass"
+            "Попробуйте QR-вход, вход по номеру еще раз или другой прокси.",
+            reply_markup=get_auth_method_markup(),
         )
     except Exception:
         logger.exception("Не удалось подключить временный клиент для пользователя %s", user_id)
-        try:
+        with contextlib.suppress(Exception):
             await new_client.disconnect()
-        except Exception:
-            logger.debug("Временный клиент не был подключен", exc_info=True)
 
-        user_states[user_id] = "WAIT_PROXY"
+        user_states[user_id] = "SELECT_AUTH_METHOD"
         await status_message.edit_text(
             "Не удалось подключить клиент аккаунта.\n\n"
-            "Попробуйте отправить 'нет' еще раз или укажите прокси."
+            "Попробуйте QR-вход, вход по номеру еще раз или другой прокси.",
+            reply_markup=get_auth_method_markup(),
         )
+
 
 async def list_channels(user_id, obj, mode):
     is_callback = isinstance(obj, CallbackQuery)
@@ -820,10 +832,7 @@ async def list_channels(user_id, obj, mode):
     client_acc = temp_clients.get(user_id)
 
     if not client_acc:
-        if is_callback:
-            await base_message.edit_text("Временный клиент аккаунта не найден.")
-        else:
-            await base_message.reply("Временный клиент аккаунта не найден.")
+        await base_message.answer("Временный клиент аккаунта не найден.")
         return
 
     if mode == "target":
@@ -844,67 +853,64 @@ async def list_channels(user_id, obj, mode):
         text = "Выберите канал:"
         manual_text = "Ввести вручную"
 
-    buttons = [[InlineKeyboardButton(manual_text, callback_data=f"sel_{mode}_manual")]]
+    rows = [[button(manual_text, f"sel_{mode}_manual")]]
 
     if mode == "report":
-        buttons[0].append(
-            InlineKeyboardButton("Избранное", callback_data="sel_report_me")
-        )
+        rows[0].append(button("Избранное", "sel_report_me"))
 
     try:
-        async for dialog in client_acc.get_dialogs(limit=200):
-            chat = dialog.chat
-            if chat.type in [
-                enums.ChatType.CHANNEL,
-                enums.ChatType.SUPERGROUP,
-                enums.ChatType.GROUP,
-            ]:
-                buttons.append(
-                    [InlineKeyboardButton(f"{chat.title}", callback_data=f"sel_{mode}_{chat.id}")]
-                )
-
-        markup = InlineKeyboardMarkup(buttons)
+        async for dialog in client_acc.iter_dialogs(limit=200):
+            entity = dialog.entity
+            if dialog.is_channel or dialog.is_group:
+                title = getattr(entity, "title", None) or dialog.name or "Без названия"
+                rows.append([button(title, f"sel_{mode}_{utils.get_peer_id(entity)}")])
 
         if is_callback:
-            await base_message.edit_text(text, reply_markup=markup)
+            await base_message.edit_text(text, reply_markup=markup(rows))
         else:
-            await base_message.reply(text, reply_markup=markup)
-
+            await base_message.answer(text, reply_markup=markup(rows))
     except Exception:
         logger.exception("Не удалось получить список каналов для пользователя %s", user_id)
         if is_callback:
             await base_message.edit_text("Не удалось загрузить список каналов.")
         else:
-            await base_message.reply("Не удалось загрузить список каналов.")
+            await base_message.answer("Не удалось загрузить список каналов.")
 
 
 async def find_and_set_channel(user_id, message, target, key):
     client_acc = temp_clients.get(user_id)
     if not client_acc:
-        await message.reply("Временный клиент аккаунта не найден. Начните заново.")
+        await message.answer("Временный клиент аккаунта не найден. Начните заново.")
+        return
+
+    if target == "me":
+        temp_data[user_id][key] = "me"
+        user_states[user_id] = "WAIT_MSG"
+        await message.answer("Введите текст сообщения. Разделитель: |")
         return
 
     try:
-        chat = await client_acc.get_chat(target)
+        chat = await client_acc.get_entity(target)
     except Exception:
         try:
-            chat = await client_acc.join_chat(target)
+            updates = await client_acc(functions.channels.JoinChannelRequest(target))
+            chat = updates.chats[0] if getattr(updates, "chats", None) else await client_acc.get_entity(target)
         except Exception:
             logger.exception("Не удалось найти или подключить канал: %s", target)
-            await message.reply("Канал не найден.")
+            await message.answer("Канал не найден.")
             return
 
-    temp_data[user_id][key] = chat.id
+    temp_data[user_id][key] = utils.get_peer_id(chat)
 
     if key == "target_channel_id":
         await list_channels(user_id, message, "report")
     else:
         user_states[user_id] = "WAIT_MSG"
-        await message.reply("Введите текст сообщения. Разделитель: |")
+        await message.answer("Введите текст сообщения. Разделитель: |")
 
 
-@admin_app.on_message(filters.photo)
-async def process_photo(client, message):
+@dp.message(F.photo)
+async def process_photo(message: Message):
     user_id = message.from_user.id
 
     if user_states.get(user_id) != "WAIT_PHOTO":
@@ -912,18 +918,18 @@ async def process_photo(client, message):
 
     if user_id not in temp_data or "name" not in temp_data[user_id]:
         await cleanup_user(user_id)
-        await message.reply("Временные данные были очищены. Начните заново через /start")
+        await message.answer("Временные данные были очищены. Начните заново через /start")
         return
 
     os.makedirs(DOWNLOADS_DIR, exist_ok=True)
     path = os.path.join(DOWNLOADS_DIR, f"photo_{temp_data[user_id]['name']}.jpg")
-    downloaded_path = await message.download(file_name=path)
+    await admin_bot.download(message.photo[-1], destination=path)
 
-    if not downloaded_path:
-        await message.reply("Не удалось скачать фото. Попробуйте отправить его еще раз.")
+    if not os.path.exists(path):
+        await message.answer("Не удалось скачать фото. Попробуйте отправить его еще раз.")
         return
 
-    await finish_wizard(message, downloaded_path)
+    await finish_wizard(message, path)
 
 
 async def finish_wizard(message, photo_path):
@@ -931,12 +937,17 @@ async def finish_wizard(message, photo_path):
 
     if user_id not in temp_data:
         await cleanup_user(user_id)
-        await message.reply("Временные данные были очищены. Начните заново через /start")
+        await message.answer("Временные данные были очищены. Начните заново через /start")
         return
 
     data = temp_data[user_id]
     data["photo_path"] = photo_path
     data["enabled"] = False
+    data["client_type"] = "telethon"
+
+    client_acc = temp_clients.get(user_id)
+    if isinstance(client_acc, TelegramClient):
+        data["telethon_session"] = client_acc.session.save()
 
     for key in ["phone", "phone_hash"]:
         data.pop(key, None)
@@ -946,18 +957,16 @@ async def finish_wizard(message, photo_path):
     save_config(config)
 
     await cleanup_user(user_id)
-    await message.reply(f"Задача «{data['name']}» создана.")
+    await message.answer(f"Задача «{data['name']}» создана.")
 
 
-@admin_app.on_callback_query()
-async def handle_callback(client, callback: CallbackQuery):
-    data = callback.data
+@dp.callback_query()
+async def handle_callback(callback: CallbackQuery):
+    data = callback.data or ""
 
     if data in ("refresh", "back_main"):
+        await callback.answer()
         await show_main_menu(callback)
-        return
-
-    if data == "add_new_task":
         return
 
     if data == "cancel_add":
@@ -991,20 +1000,18 @@ async def handle_callback(client, callback: CallbackQuery):
             f"Паузы: {pauses_text}"
         )
 
-        buttons = [[
-            InlineKeyboardButton("Остановить", callback_data=f"stop_{task_name}")
+        rows = [[
+            button("Остановить", f"stop_{task_name}")
             if task_name in active_tasks
-            else InlineKeyboardButton("Запустить", callback_data=f"start_{task_name}")
+            else button("Запустить", f"start_{task_name}")
         ]]
-        buttons.append([
-            InlineKeyboardButton("Удалить", callback_data=f"del_{task_name}"),
-            InlineKeyboardButton("Назад", callback_data="back_main"),
+        rows.append([
+            button("Удалить", f"del_{task_name}"),
+            button("Назад", "back_main"),
         ])
 
-        await callback.message.edit_text(
-            info,
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
+        await callback.answer()
+        await callback.message.edit_text(info, reply_markup=markup(rows))
         return
 
     if data.startswith("start_"):
@@ -1020,7 +1027,6 @@ async def handle_callback(client, callback: CallbackQuery):
             return
 
         await callback.message.edit_text(f"Запускаю задачу «{task_name}»...")
-
         worker = AutoApproveWorker(
             task_name=task_name,
             api_id="<REDACTED>"
@@ -1032,6 +1038,7 @@ async def handle_callback(client, callback: CallbackQuery):
             photo_path=config.get("photo_path"),
             session_file=config.get("session_file"),
             pauses=config.get("pauses"),
+            telethon_session=config.get("telethon_session"),
         )
 
         success, result_message = await worker.start()
@@ -1094,6 +1101,7 @@ async def restore_enabled_tasks():
                 photo_path=task_config.get("photo_path"),
                 session_file=task_config.get("session_file"),
                 pauses=task_config.get("pauses"),
+                telethon_session=task_config.get("telethon_session"),
             )
 
             success, result_message = await worker.start()
@@ -1103,7 +1111,6 @@ async def restore_enabled_tasks():
             else:
                 logger.warning("Не удалось восстановить задачу %s: %s", task_name, result_message)
                 set_task_enabled(task_name, False)
-
         except Exception:
             logger.exception("Непредвиденная ошибка при восстановлении задачи %s", task_name)
             set_task_enabled(task_name, False)
@@ -1120,18 +1127,16 @@ async def stop_active_tasks():
 
 
 async def main():
-    await admin_app.start()
-    logger.info("Админ-бот запущен")
+    logger.info("Админ-бот Bot API запускается")
+    await admin_bot.delete_webhook(drop_pending_updates=False)
+    await restore_enabled_tasks()
+
     try:
-        await restore_enabled_tasks()
-        await idle()
+        await dp.start_polling(admin_bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await stop_active_tasks()
-        try:
-            await admin_app.stop()
-        except Exception:
-            logger.exception("Не удалось корректно остановить админ-бота")
+        await admin_bot.session.close()
 
 
 if __name__ == "__main__":
-    admin_app.run(main())
+    asyncio.run(main())
