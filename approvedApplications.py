@@ -293,6 +293,7 @@ class AutoApproveWorker:
         self.last_approval_time = None
         self.daily_count = 0
         self.known_dialog_users = set()
+        self.second_messages_in_progress = set()
         self.is_running = False
         self.background_tasks = []
         self.target_input_peer = None
@@ -330,10 +331,15 @@ class AutoApproveWorker:
                 binding_store.queue_manual(user_id, "second_message_not_configured", self.task_name)
                 await self.report(f"Ручная обработка\nПользователь: {user_report_label(user_id, peer)}\nПричина: для задачи {self.task_name} не задано 2-е сообщение")
                 return
-            if not binding_store.mark_sent_once(user_id, 2):
+            if binding["second_sent_at"] or user_id in self.second_messages_in_progress:
                 return
-            await self.send_message_safe(user_id, random.choice(self.second_messages))
-            await self.report(f"Диалог\nПользователь: {user_report_label(user_id, peer)}\nСтатус: 2-е сообщение отправлено с аккаунта {self.task_name}")
+            self.second_messages_in_progress.add(user_id)
+            try:
+                await self.send_message_safe(user_id, random.choice(self.second_messages))
+                binding_store.mark_sent_once(user_id, 2)
+                await self.report(f"Диалог\nПользователь: {user_report_label(user_id, peer)}\nСтатус: 2-е сообщение отправлено с аккаунта {self.task_name}")
+            finally:
+                self.second_messages_in_progress.discard(user_id)
         except Exception:
             logger.exception("[%s] Не удалось обработать сообщение диалога", self.task_name)
             binding_store.queue_manual(getattr(locals().get("peer"), "id", 0), "second_message_error", self.task_name)

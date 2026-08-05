@@ -231,7 +231,7 @@ def to_telethon_proxy(proxy):
     }.get(proxy.get("scheme"), socks.SOCKS5)
 
     username = proxy.get("username")
-    password = "<REDACTED>"
+    password = proxy.get("password") or ""
     if username:
         return (
             proxy_type,
@@ -422,9 +422,9 @@ async def process_wizard(message: Message):
             await message.answer("Временный клиент аккаунта не найден. Начните заново.")
             return
 
-        phone = "<REDACTED>"
+        phone = text.replace(" ", "").replace("-", "")
         if not phone.startswith("+"):
-            phone = "<REDACTED>"
+            phone = "+" + phone
 
         temp_data[user_id]["phone"] = phone
 
@@ -451,7 +451,7 @@ async def process_wizard(message: Message):
         try:
             await asyncio.wait_for(
                 client_acc.sign_in(
-                    phone="<REDACTED>"
+                    phone=temp_data[user_id]["phone"],
                     code=text.strip(),
                     phone_code_hash=temp_data[user_id]["phone_hash"],
                 ),
@@ -492,6 +492,22 @@ async def process_wizard(message: Message):
 
     elif state == "WAIT_REPORT_MANUAL":
         await find_and_set_channel(user_id, message, text, "report_channel_id")
+
+    elif state == "WAIT_SECOND_MSG":
+        messages = [item.strip() for item in text.split("|") if item.strip()]
+        task_name = temp_data[user_id].get("editing_second_task")
+        config = load_config()
+        if not messages:
+            await message.answer("Укажите хотя бы один вариант. Разделитель вариантов: |")
+            return
+        if not task_name or task_name not in config:
+            await cleanup_user(user_id)
+            await message.answer("Задача не найдена. Откройте её карточку ещё раз.")
+            return
+        config[task_name]["second_messages"] = messages
+        save_config(config)
+        await cleanup_user(user_id)
+        await message.answer(f"✅ Второе сообщение сохранено для задачи «{task_name}». Вариантов: {len(messages)}")
 
     elif state == "WAIT_MSG":
         messages = [item.strip() for item in text.split("|") if item.strip()]
@@ -659,7 +675,7 @@ async def handle_channel_selection(callback: CallbackQuery):
             return
 
         chat_id_raw = data.split("_", 2)[2]
-        chat_id = "<REDACTED>"
+        chat_id = "me" if chat_id_raw == "me" else int(chat_id_raw)
         client_acc = temp_clients.get(user_id)
 
         if not client_acc:
@@ -997,7 +1013,9 @@ async def handle_callback(callback: CallbackQuery):
             f"Задача: {task_name}\n"
             f"Статус: {status}\n"
             f"Аккаунт: {session_name}\n"
-            f"Паузы: {pauses_text}"
+            f"Паузы: {pauses_text}\n"
+            f"2-е сообщение: {'настроено' if config.get('second_messages') else 'не настроено'}\n"
+            f"3-е сообщение: {'настроено' if config.get('messages') else 'не настроено'}"
         )
 
         rows = [[
@@ -1006,12 +1024,29 @@ async def handle_callback(callback: CallbackQuery):
             else button("Запустить", f"start_{task_name}")
         ]]
         rows.append([
+            button("Настроить 2-е сообщение", f"second_{task_name}"),
+        ])
+        rows.append([
             button("Удалить", f"del_{task_name}"),
             button("Назад", "back_main"),
         ])
 
         await callback.answer()
         await callback.message.edit_text(info, reply_markup=markup(rows))
+        return
+
+    if data.startswith("second_"):
+        task_name = data.split("_", 1)[1]
+        if task_name not in load_config():
+            await callback.answer("Задача не найдена", show_alert=True)
+            return
+        user_states[callback.from_user.id] = "WAIT_SECOND_MSG"
+        temp_data[callback.from_user.id] = {"editing_second_task": task_name}
+        await callback.answer()
+        await callback.message.edit_text(
+            f"2-е сообщение для задачи «{task_name}».\n\n"
+            "Отправьте текст. Для нескольких вариантов разделяйте их символом |"
+        )
         return
 
     if data.startswith("start_"):
@@ -1029,12 +1064,13 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.edit_text(f"Запускаю задачу «{task_name}»...")
         worker = AutoApproveWorker(
             task_name=task_name,
-            api_id="<REDACTED>"
-            api_hash="<REDACTED>"
+            api_id=config.get("api_id", API_ID),
+            api_hash=config.get("api_hash", API_HASH),
             proxy=config.get("proxy"),
             target_channel_id=config["target_channel_id"],
             report_channel_id=config["report_channel_id"],
             messages=config["messages"],
+            second_messages=config.get("second_messages"),
             photo_path=config.get("photo_path"),
             session_file=config.get("session_file"),
             pauses=config.get("pauses"),
@@ -1092,12 +1128,13 @@ async def restore_enabled_tasks():
         try:
             worker = AutoApproveWorker(
                 task_name=task_name,
-                api_id="<REDACTED>"
-                api_hash="<REDACTED>"
+                api_id=task_config.get("api_id", API_ID),
+                api_hash=task_config.get("api_hash", API_HASH),
                 proxy=task_config.get("proxy"),
                 target_channel_id=task_config["target_channel_id"],
                 report_channel_id=task_config["report_channel_id"],
                 messages=task_config["messages"],
+                second_messages=task_config.get("second_messages"),
                 photo_path=task_config.get("photo_path"),
                 session_file=task_config.get("session_file"),
                 pauses=task_config.get("pauses"),
