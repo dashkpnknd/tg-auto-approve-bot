@@ -493,9 +493,11 @@ async def process_wizard(message: Message):
     elif state == "WAIT_REPORT_MANUAL":
         await find_and_set_channel(user_id, message, text, "report_channel_id")
 
-    elif state == "WAIT_SECOND_MSG":
+    elif state in ("WAIT_SECOND_MSG", "WAIT_THIRD_MSG"):
         messages = [item.strip() for item in text.split("|") if item.strip()]
-        task_name = temp_data[user_id].get("editing_second_task")
+        task_name = temp_data[user_id].get("editing_message_task")
+        message_key = "second_messages" if state == "WAIT_SECOND_MSG" else "messages"
+        message_number = "2-е" if state == "WAIT_SECOND_MSG" else "3-е"
         config = load_config()
         if not messages:
             await message.answer("Укажите хотя бы один вариант. Разделитель вариантов: |")
@@ -504,10 +506,10 @@ async def process_wizard(message: Message):
             await cleanup_user(user_id)
             await message.answer("Задача не найдена. Откройте её карточку ещё раз.")
             return
-        config[task_name]["second_messages"] = messages
+        config[task_name][message_key] = messages
         save_config(config)
         await cleanup_user(user_id)
-        await message.answer(f"✅ Второе сообщение сохранено для задачи «{task_name}». Вариантов: {len(messages)}")
+        await message.answer(f"✅ {message_number} сообщение сохранено для задачи «{task_name}». Вариантов: {len(messages)}")
 
     elif state == "WAIT_MSG":
         messages = [item.strip() for item in text.split("|") if item.strip()]
@@ -1025,6 +1027,7 @@ async def handle_callback(callback: CallbackQuery):
         ]]
         rows.append([
             button("Настроить 2-е сообщение", f"second_{task_name}"),
+            button("Настроить 3-е сообщение", f"third_{task_name}"),
         ])
         rows.append([
             button("Удалить", f"del_{task_name}"),
@@ -1035,16 +1038,17 @@ async def handle_callback(callback: CallbackQuery):
         await callback.message.edit_text(info, reply_markup=markup(rows))
         return
 
-    if data.startswith("second_"):
-        task_name = data.split("_", 1)[1]
+    if data.startswith(("second_", "third_")):
+        message_stage, task_name = data.split("_", 1)
         if task_name not in load_config():
             await callback.answer("Задача не найдена", show_alert=True)
             return
-        user_states[callback.from_user.id] = "WAIT_SECOND_MSG"
-        temp_data[callback.from_user.id] = {"editing_second_task": task_name}
+        message_number = "2-е" if message_stage == "second" else "3-е"
+        user_states[callback.from_user.id] = "WAIT_SECOND_MSG" if message_stage == "second" else "WAIT_THIRD_MSG"
+        temp_data[callback.from_user.id] = {"editing_message_task": task_name}
         await callback.answer()
         await callback.message.edit_text(
-            f"2-е сообщение для задачи «{task_name}».\n\n"
+            f"{message_number} сообщение для задачи «{task_name}».\n\n"
             "Отправьте текст. Для нескольких вариантов разделяйте их символом |"
         )
         return
