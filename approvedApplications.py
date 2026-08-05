@@ -3,6 +3,8 @@ import contextlib
 import logging
 import os
 import random
+import sqlite3
+import threading
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import unquote, urlparse
@@ -22,6 +24,72 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_FILE = os.path.join(BASE_DIR, ".env")
 MAX_PHOTO_CAPTION_LENGTH = 1024
 REPORT_TIMEZONE = ZoneInfo("Europe/Moscow")
+
+
+class ClientBindingStore:
+    """Durable client → sender-account mapping and an idempotency ledger."""
+
+    def __init__(self, path=None):
+        self.path = path or os.path.join(BASE_DIR, "client_bindings.sqlite3")
+        self.lock = threading.Lock()
+        with self._connect() as db:
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS client_bindings (
+                    user_id INTEGER PRIMARY KEY,
+                    task_name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    source_message_id INTEGER,
+                    second_sent_at TEXT,
+                    third_sent_at TEXT,
+                    last_error TEXT
+                );
+                CREATE TABLE IF NOT EXISTS manual_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
+                    details TEXT,
+                    created_at TEXT NOT NULL,
+                    resolved INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(user_id, reason, resolved)
+                );
+            """)
+
+    def _connect(self):
+        db = sqlite3.connect(self.path, timeout=15)
+        db.row_factory = sqlite3.Row
+        return db
+
+    def bind_if_absent(self, user_id, task_name, message_id=None):
+        with self.lock, self._connect() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO client_bindings(user_id,task_name,created_at,source_message_id) VALUES(?,?,?,?)",
+                (user_id, task_name, datetime.utcnow().isoformat(), message_id),
+            )
+            return db.execute("SELECT * FROM client_bindings WHERE user_id=?", (user_id,)).fetchone()
+
+    def binding(self, user_id):
+        with self.lock, self._connect() as db:
+            return db.execute("SELECT * FROM client_bindings WHERE user_id=?", (user_id,)).fetchone()
+
+    def mark_sent_once(self, user_id, stage):
+        column = "second_sent_at" if stage == 2 else "third_sent_at"
+        with self.lock, self._connect() as db:
+            row = db.execute("SELECT %s FROM client_bindings WHERE user_id=?" % column, (user_id,)).fetchone()
+            if not row or row[0]:
+                return False
+            db.execute("UPDATE client_bindings SET %s=?,last_error=NULL WHERE user_id=?" % column, (datetime.utcnow().isoformat(), user_id))
+            return True
+
+    def queue_manual(self, user_id, reason, details=""):
+        with self.lock, self._connect() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO manual_queue(user_id,reason,details,created_at) VALUES(?,?,?,?)",
+                (user_id, reason, details, datetime.utcnow().isoformat()),
+            )
+
+
+binding_store = ClientBindingStore()
+active_workers = {}
 
 
 def resolve_photo_path(photo_path):
@@ -128,7 +196,7 @@ def to_telethon_proxy(proxy):
     }.get(effective_proxy.get("scheme"), socks.SOCKS5)
 
     username = effective_proxy.get("username")
-    password = "<REDACTED>"
+    password = effective_proxy.get("password") or ""
     if username:
         return (
             proxy_type,
@@ -188,6 +256,7 @@ class AutoApproveWorker:
         target_channel_id,
         report_channel_id,
         messages,
+        second_messages=None,
         photo_path=None,
         session_file=None,
         pauses=None,
@@ -197,6 +266,7 @@ class AutoApproveWorker:
         self.target_channel_id = target_channel_id
         self.report_channel_id = report_channel_id
         self.messages = messages or []
+        self.second_messages = second_messages or []
         self.photo_path = resolve_photo_path(photo_path)
         self.session_name = session_file if session_file else task_name
         self.session_string = telethon_session or ""
@@ -237,6 +307,36 @@ class AutoApproveWorker:
             timeout=20,
         )
         self.app.add_event_handler(self.handle_raw_update, events.Raw)
+        self.app.add_event_handler(self.handle_dialog_message, events.NewMessage)
+
+    async def handle_dialog_message(self, event):
+        """Remember the account that opened a dialogue and send stage 2 once."""
+        if not event.is_private:
+            return
+        try:
+            peer = await event.get_chat()
+            if not peer or getattr(peer, "bot", False):
+                return
+            user_id = event.chat_id
+            if event.out:
+                # The first outbound private message fixes the account forever.
+                binding_store.bind_if_absent(user_id, self.task_name, event.message.id)
+                return
+
+            binding = binding_store.binding(user_id)
+            if not binding or binding["task_name"] != self.task_name:
+                return
+            if not self.second_messages:
+                binding_store.queue_manual(user_id, "second_message_not_configured", self.task_name)
+                await self.report(f"Ручная обработка\nПользователь: {user_report_label(user_id, peer)}\nПричина: для задачи {self.task_name} не задано 2-е сообщение")
+                return
+            if not binding_store.mark_sent_once(user_id, 2):
+                return
+            await self.send_message_safe(user_id, random.choice(self.second_messages))
+            await self.report(f"Диалог\nПользователь: {user_report_label(user_id, peer)}\nСтатус: 2-е сообщение отправлено с аккаунта {self.task_name}")
+        except Exception:
+            logger.exception("[%s] Не удалось обработать сообщение диалога", self.task_name)
+            binding_store.queue_manual(getattr(locals().get("peer"), "id", 0), "second_message_error", self.task_name)
 
     async def resolve_peer(self, chat_id):
         if chat_id == "me":
@@ -438,6 +538,38 @@ class AutoApproveWorker:
                 )
             )
 
+    async def send_third_from_bound_account(self, user_id, user_label):
+        binding = binding_store.binding(user_id)
+        if not binding:
+            candidates = [worker for worker in active_workers.values() if user_id in worker.known_dialog_users]
+            if len(candidates) == 1:
+                binding = binding_store.bind_if_absent(user_id, candidates[0].task_name)
+                logger.info("Клиент %s автоматически привязан к аккаунту %s по существующему диалогу", user_id, candidates[0].task_name)
+            else:
+                details = "нет диалога" if not candidates else "несколько аккаунтов: " + ", ".join(worker.task_name for worker in candidates)
+                binding_store.queue_manual(user_id, "sender_not_bound", details)
+                return "не отправлено: нет однозначной привязки к рассылочному аккаунту, передано вручную"
+
+        sender = active_workers.get(binding["task_name"])
+        if not sender or not sender.is_running:
+            binding_store.queue_manual(user_id, "sender_account_unavailable", binding["task_name"])
+            return "не отправлено: привязанный аккаунт недоступен, передано вручную"
+        if not sender.messages:
+            binding_store.queue_manual(user_id, "third_message_not_configured", binding["task_name"])
+            return "не отправлено: для привязанного аккаунта не задано 3-е сообщение"
+        if binding["third_sent_at"]:
+            return "не отправлено: 3-е сообщение уже отправлялось"
+
+        try:
+            await sender.send_message_safe(user_id, random.choice(sender.messages))
+            if binding_store.mark_sent_once(user_id, 3):
+                return f"3-е сообщение отправлено с аккаунта {binding['task_name']}"
+            return "не отправлено: 3-е сообщение уже отправлялось"
+        except Exception:
+            logger.exception("[%s] Не удалось отправить 3-е сообщение пользователю %s", sender.task_name, user_id)
+            binding_store.queue_manual(user_id, "third_message_error", sender.task_name)
+            return "ошибка отправки, передано вручную"
+
     async def scan_pending_requests(self, is_startup=False):
         count = 0
 
@@ -531,23 +663,7 @@ class AutoApproveWorker:
                 self.daily_count += 1
                 self.processed_users.add(user_id)
 
-                message_status = "не задано"
-                if self.messages:
-                    try:
-                        text = random.choice(self.messages)
-                        greeting_sent = await self.send_greeting_if_needed(user_id, text)
-                        message_status = (
-                            "отправлено"
-                            if greeting_sent
-                            else "не отправлено, личный диалог уже есть"
-                        )
-                    except Exception:
-                        logger.exception(
-                            "[%s] Не удалось отправить сообщение пользователю %s",
-                            self.task_name,
-                            user_id,
-                        )
-                        message_status = "ошибка отправки"
+                message_status = await self.send_third_from_bound_account(user_id, user_label)
 
                 await self.report(
                     "Заявка одобрена\n"
@@ -601,6 +717,7 @@ class AutoApproveWorker:
             return False, "Не удалось отправить сообщение о запуске в чат отчетов"
 
         self.is_running = True
+        active_workers[self.task_name] = self
         self.background_tasks = [
             asyncio.create_task(self.worker_loop()),
             asyncio.create_task(self.scan_pending_requests(is_startup=True)),
@@ -611,6 +728,7 @@ class AutoApproveWorker:
         return True, "Задача успешно запущена"
 
     async def stop(self):
+        active_workers.pop(self.task_name, None)
         self.is_running = False
 
         for task in self.background_tasks:
