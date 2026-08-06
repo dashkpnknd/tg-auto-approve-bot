@@ -344,8 +344,15 @@ class CampaignWorker:
         for importer in result.importers:
             candidates = []
             for account_id, client in self.senders.items():
-                with contextlib.suppress(Exception):
-                    if await client.get_input_entity(importer.user_id): candidates.append(account_id)
+                # Only an actual private dialog proves the source account. A cached
+                # contact alone must not silently move a client between accounts.
+                try:
+                    async for dialog in client.iter_dialogs(limit=3000):
+                        if isinstance(dialog.entity, types.User) and dialog.entity.id == importer.user_id:
+                            candidates.append(account_id)
+                            break
+                except Exception:
+                    logger.exception("Cannot inspect dialogs for old request")
             if len(candidates) != 1:
                 store.queue(self.id, importer.user_id, "sender_not_unique", ",".join(candidates) or "not found")
                 continue
