@@ -497,7 +497,12 @@ async def process_wizard(message: Message):
             await message.answer("Не удалось проверить сессию. Проверьте строку и прокси.")
 
     elif state in ("ACCOUNT_SECOND", "ACCOUNT_THIRD"):
-        variants = [part.strip() for part in text.split("|") if part.strip()]
+        # A forwarded Telegram message keeps quotes, links and formatting as HTML.
+        # Plain text remains available for quick variants separated by '|'.
+        if getattr(message, "forward_origin", None) and message.html_text:
+            variants = [{"html": message.html_text}]
+        else:
+            variants = [part.strip() for part in text.split("|") if part.strip()]
         if not variants:
             await message.answer("Укажите хотя бы один вариант текста."); return
         registry = load_accounts(); account_id = temp_data[user_id].get("account_id")
@@ -1209,7 +1214,7 @@ async def handle_callback(callback: CallbackQuery):
             await callback.answer(); await callback.message.edit_text("Введите новый прокси или «нет» для отключения."); return
         user_states[callback.from_user.id] = "ACCOUNT_SECOND" if action == "second" else "ACCOUNT_THIRD"
         temp_data[callback.from_user.id] = {"account_id": account_id}
-        await callback.answer(); await callback.message.edit_text("Отправьте варианты текста через символ |."); return
+        await callback.answer(); await callback.message.edit_text("Перешлите готовое сообщение из Telegram — оформление, цитаты и ссылки сохранятся.\n\nЛибо отправьте текстовые варианты через символ |."); return
     if data == "campaign_add":
         if not load_accounts(): await callback.answer("Сначала подключите хотя бы один аккаунт", show_alert=True); return
         user_states[callback.from_user.id] = "CAMPAIGN_NAME"; temp_data[callback.from_user.id] = {"campaign_id": new_campaign_id()}

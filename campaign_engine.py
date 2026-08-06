@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from telethon import TelegramClient, events, functions, types, utils
 from telethon.errors import FloodWaitError, RPCError
+from telethon.extensions import html
 from telethon.sessions import StringSession
 
 from config_local import API_HASH, API_ID
@@ -129,6 +130,14 @@ def client_for(account):
     return TelegramClient(StringSession(account.get("telethon_session", "")), API_ID, API_HASH, proxy=proxy_tuple(account.get("proxy")), connection_retries=5, request_retries=3, timeout=20)
 
 
+async def send_campaign_message(client, chat_id, content):
+    """Send plain text or Bot API HTML captured from a forwarded message."""
+    if isinstance(content, dict) and content.get("html"):
+        text, entities = html.parse(content["html"])
+        return await client.send_message(chat_id, text, formatting_entities=entities)
+    return await client.send_message(chat_id, content)
+
+
 class CampaignWorker:
     def __init__(self, campaign_id, definition):
         self.id, self.data = campaign_id, definition
@@ -179,7 +188,7 @@ class CampaignWorker:
             reply_min = max(0, int(pauses.get("reply_min", 1)))
             reply_max = max(0, int(pauses.get("reply_max", 3)))
             await asyncio.sleep(random.randint(*sorted((reply_min, reply_max))) * 60)
-            await self.senders[account_id].send_message(user_id, random.choice(messages))
+            await send_campaign_message(self.senders[account_id], user_id, random.choice(messages))
             if store.mark_once(self.id, user_id, 2):
                 await self.report(f"Ответ обработан\nКлиент: {label or user_id}\n2-е сообщение: отправлено с «{account.get('name', account_id)}»")
         except Exception as exc:
@@ -261,7 +270,7 @@ class CampaignWorker:
             third_min = max(0, int(pauses.get("third_min", 1)))
             third_max = max(0, int(pauses.get("third_max", 3)))
             await asyncio.sleep(random.randint(*sorted((third_min, third_max))) * 60)
-            await sender.send_message(user_id, random.choice(messages))
+            await send_campaign_message(sender, user_id, random.choice(messages))
             return f"отправлено с «{account.get('name', account_id)}»" if store.mark_once(self.id, user_id, 3) else "не отправлено: уже было отправлено"
         except Exception as exc:
             store.queue(self.id, user_id, "third_message_error", str(exc)[:300])
