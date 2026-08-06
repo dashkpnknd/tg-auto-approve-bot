@@ -335,14 +335,25 @@ async def save_new_account(user_id, message):
     """Persist a completed account-login flow without coupling it to a task."""
     data = temp_data.get(user_id, {})
     client = temp_clients.get(user_id)
-    if not client or not data.get("account_name"):
+    if not client:
         await cleanup_user(user_id)
         await message.answer("Данные подключения потеряны. Начните добавление аккаунта снова.")
+        return
+    try:
+        profile = await client.get_me()
+        full_name = " ".join(part for part in [getattr(profile, "first_name", ""), getattr(profile, "last_name", "")] if part).strip()
+        username = getattr(profile, "username", None)
+        base_name = full_name or username or f"ID {profile.id}"
+        account_name = f"{base_name} (@{username})" if username else f"{base_name} (без username)"
+    except Exception:
+        await cleanup_user(user_id)
+        await message.answer("Не удалось получить профиль Telegram. Подключите аккаунт ещё раз.")
         return
     registry = load_accounts()
     account_id = data.get("account_id") or new_campaign_id()
     registry[account_id] = {
-        "id": account_id, "name": data["account_name"],
+        "id": account_id, "name": account_name,
+        "profile_name": base_name, "username": username,
         "telethon_session": client.session.save(), "proxy": data.get("proxy"),
         "enabled": True, "second_messages": [], "third_messages": [],
         "created_at": __import__("datetime").datetime.utcnow().isoformat(),
@@ -353,7 +364,7 @@ async def save_new_account(user_id, message):
     if flow and flow.get("task") is asyncio.current_task():
         qr_login_flows.pop(user_id, None)
     await cleanup_user(user_id)
-    await message.answer(f"Аккаунт «{data['account_name']}» подключён. Настройте 2-е и 3-е сообщения в его карточке.")
+    await message.answer(f"Аккаунт «{account_name}» подключён. Настройте 2-е и 3-е сообщения в его карточке.")
 
 
 async def after_authorized(user_id, message):
@@ -450,16 +461,7 @@ async def process_wizard(message: Message):
         await message.answer("Временные данные были очищены. Начните заново через /start")
         return
 
-    if state == "ACCOUNT_NAME":
-        name = text.strip()
-        if not name or len(name) > 60:
-            await message.answer("Укажите короткое название аккаунта.")
-            return
-        temp_data[user_id]["account_name"] = name
-        user_states[user_id] = "ACCOUNT_PROXY"
-        await message.answer("Введите прокси или отправьте «нет».\n\n" + proxy_format_hint())
-
-    elif state == "ACCOUNT_PROXY":
+    if state == "ACCOUNT_PROXY":
         try:
             temp_data[user_id]["proxy"] = None if text.lower() in ("нет", "no", "-") else parse_proxy(text)
         except Exception:
@@ -1161,9 +1163,9 @@ async def handle_callback(callback: CallbackQuery):
     if data == "campaigns_menu":
         await callback.answer(); await show_campaigns_menu(callback); return
     if data == "account_add":
-        user_states[callback.from_user.id] = "ACCOUNT_NAME"
+        user_states[callback.from_user.id] = "ACCOUNT_PROXY"
         temp_data[callback.from_user.id] = {"flow": "account", "account_id": new_campaign_id()}
-        await callback.answer(); await callback.message.edit_text("Название подключаемого аккаунта:"); return
+        await callback.answer(); await callback.message.edit_text("Введите прокси или отправьте «нет».\n\n" + proxy_format_hint()); return
     if data.startswith("account_auth_"):
         method = data.rsplit("_", 1)[1]; user_id = callback.from_user.id
         if user_states.get(user_id) != "ACCOUNT_AUTH":
