@@ -419,6 +419,7 @@ async def show_main_menu(message_or_callback):
     rows = [
         [button("Аккаунты", "accounts_menu"), button("Кампании", "campaigns_menu")],
         [button("Старые задачи", "legacy_menu")],
+        [button("Создать задачу: 1 аккаунт + 1 канал", "add_new_task")],
     ]
 
     for task_name in config.keys():
