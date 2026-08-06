@@ -16,6 +16,11 @@ from telethon.errors import SessionPasswordNeededError
 from telethon.sessions import StringSession
 
 from approvedApplications import AutoApproveWorker
+from campaign_engine import (
+    CampaignWorker, accounts as load_accounts, campaigns as load_campaigns,
+    save_accounts, save_campaigns, active_campaigns, store as campaign_store,
+    new_id as new_campaign_id,
+)
 from config_local import API_HASH, API_ID, BOT_TOKEN, TASKS_FILE
 
 logging.basicConfig(
@@ -326,6 +331,72 @@ async def cleanup_user(user_id: int):
             temp_clients.pop(user_id, None)
 
 
+async def save_new_account(user_id, message):
+    """Persist a completed account-login flow without coupling it to a task."""
+    data = temp_data.get(user_id, {})
+    client = temp_clients.get(user_id)
+    if not client or not data.get("account_name"):
+        await cleanup_user(user_id)
+        await message.answer("Данные подключения потеряны. Начните добавление аккаунта снова.")
+        return
+    registry = load_accounts()
+    account_id = data.get("account_id") or new_campaign_id()
+    registry[account_id] = {
+        "id": account_id, "name": data["account_name"],
+        "telethon_session": client.session.save(), "proxy": data.get("proxy"),
+        "enabled": True, "second_messages": [], "third_messages": [],
+        "created_at": __import__("datetime").datetime.utcnow().isoformat(),
+    }
+    save_accounts(registry)
+    # QR completion runs inside its own waiter; do not make cleanup cancel itself.
+    flow = qr_login_flows.get(user_id)
+    if flow and flow.get("task") is asyncio.current_task():
+        qr_login_flows.pop(user_id, None)
+    await cleanup_user(user_id)
+    await message.answer(f"Аккаунт «{data['account_name']}» подключён. Настройте 2-е и 3-е сообщения в его карточке.")
+
+
+async def after_authorized(user_id, message):
+    if temp_data.get(user_id, {}).get("flow") == "account":
+        await save_new_account(user_id, message)
+    else:
+        await list_channels(user_id, message, "target")
+
+
+async def show_accounts_menu(obj):
+    registry = load_accounts()
+    rows = [[button("Подключить аккаунт", "account_add")]]
+    for account_id, account in registry.items():
+        status = "🟢" if account.get("enabled", True) else "⚪️"
+        rows.append([button(f"{status} {account.get('name', account_id)}", f"account_view_{account_id}")])
+    rows.append([button("Назад", "back_main")])
+    text = f"Аккаунты\nПодключено: {len(registry)}\n🟢 включен · ⚪️ выключен"
+    if isinstance(obj, CallbackQuery): await obj.message.edit_text(text, reply_markup=markup(rows))
+    else: await obj.answer(text, reply_markup=markup(rows))
+
+
+async def show_campaigns_menu(obj):
+    data = load_campaigns()
+    rows = [[button("Создать кампанию", "campaign_add")]]
+    for campaign_id, campaign in data.items():
+        status = "🟢" if campaign_id in active_campaigns else "🔴"
+        rows.append([button(f"{status} {campaign.get('name', campaign_id)}", f"campaign_view_{campaign_id}")])
+    rows.append([button("Назад", "back_main")])
+    text = f"Кампании\nВсего: {len(data)} · Активно: {len(active_campaigns)}"
+    if isinstance(obj, CallbackQuery): await obj.message.edit_text(text, reply_markup=markup(rows))
+    else: await obj.answer(text, reply_markup=markup(rows))
+
+
+def account_selection_rows(prefix, selected=None, include_done=False):
+    rows = []
+    for account_id, account in load_accounts().items():
+        if not account.get("enabled", True): continue
+        tick = "✓ " if selected and account_id in selected else ""
+        rows.append([button(f"{tick}{account.get('name', account_id)}", f"{prefix}{account_id}")])
+    if include_done: rows.append([button("Готово", "campaign_senders_done")])
+    return rows
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await cleanup_user(message.from_user.id)
@@ -334,14 +405,18 @@ async def cmd_start(message: Message):
 
 async def show_main_menu(message_or_callback):
     config = load_config()
-    rows = [[button("Добавить задачу", "add_new_task")]]
+    rows = [
+        [button("Аккаунты", "accounts_menu"), button("Кампании", "campaigns_menu")],
+        [button("Старые задачи", "legacy_menu")],
+        [button("Добавить старую задачу", "add_new_task")],
+    ]
 
     for task_name in config.keys():
         status = "🟢" if task_name in active_tasks else "🔴"
         rows.append([button(f"{status} {task_name}", f"view_{task_name}")])
 
     rows.append([button("Обновить список", "refresh")])
-    text = f"Панель управления\nАктивных задач: {len(active_tasks)}"
+    text = f"Панель управления\nСтарых задач активно: {len(active_tasks)}\nКампаний активно: {len(active_campaigns)}"
 
     if isinstance(message_or_callback, CallbackQuery):
         await message_or_callback.message.edit_text(text, reply_markup=markup(rows))
@@ -375,7 +450,100 @@ async def process_wizard(message: Message):
         await message.answer("Временные данные были очищены. Начните заново через /start")
         return
 
-    if state == "WAIT_NAME":
+    if state == "ACCOUNT_NAME":
+        name = text.strip()
+        if not name or len(name) > 60:
+            await message.answer("Укажите короткое название аккаунта.")
+            return
+        temp_data[user_id]["account_name"] = name
+        user_states[user_id] = "ACCOUNT_PROXY"
+        await message.answer("Введите прокси или отправьте «нет».\n\n" + proxy_format_hint())
+
+    elif state == "ACCOUNT_PROXY":
+        try:
+            temp_data[user_id]["proxy"] = None if text.lower() in ("нет", "no", "-") else parse_proxy(text)
+        except Exception:
+            await message.answer("Неверный прокси. Повторите ввод или отправьте «нет».")
+            return
+        user_states[user_id] = "ACCOUNT_AUTH"
+        await message.answer("Выберите способ подключения:", reply_markup=markup([
+            [button("Войти по QR", "account_auth_qr")],
+            [button("Войти по номеру", "account_auth_phone")],
+            [button("Вставить готовую сессию", "account_auth_session")],
+        ]))
+
+    elif state == "ACCOUNT_SESSION":
+        session = text.strip()
+        if len(session) < 20:
+            await message.answer("Похоже, строка сессии неполная. Вставьте её целиком.")
+            return
+        client = create_user_client(proxy=temp_data[user_id].get("proxy"), session_string=session)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.disconnect(); await message.answer("Эта сессия не авторизована."); return
+            temp_clients[user_id] = client
+            await save_new_account(user_id, message)
+        except Exception:
+            with contextlib.suppress(Exception): await client.disconnect()
+            await message.answer("Не удалось проверить сессию. Проверьте строку и прокси.")
+
+    elif state in ("ACCOUNT_SECOND", "ACCOUNT_THIRD"):
+        variants = [part.strip() for part in text.split("|") if part.strip()]
+        if not variants:
+            await message.answer("Укажите хотя бы один вариант текста."); return
+        registry = load_accounts(); account_id = temp_data[user_id].get("account_id")
+        if account_id not in registry:
+            await message.answer("Аккаунт не найден."); return
+        registry[account_id]["second_messages" if state == "ACCOUNT_SECOND" else "third_messages"] = variants
+        save_accounts(registry); await cleanup_user(user_id)
+        await message.answer("Сообщение сохранено.")
+
+    elif state == "ACCOUNT_EDIT_PROXY":
+        account_id = temp_data[user_id].get("account_id"); registry = load_accounts()
+        if account_id not in registry:
+            await cleanup_user(user_id); await message.answer("Аккаунт не найден."); return
+        try:
+            registry[account_id]["proxy"] = None if text.lower() in ("нет", "no", "-") else parse_proxy(text)
+        except Exception:
+            await message.answer("Неверный формат прокси. Повторите ввод."); return
+        save_accounts(registry); await cleanup_user(user_id)
+        await message.answer("Прокси сохранён. Он будет применён при следующем запуске кампании.")
+
+    elif state == "CAMPAIGN_NAME":
+        if not text or len(text) > 80:
+            await message.answer("Укажите название кампании до 80 символов."); return
+        temp_data[user_id]["campaign_name"] = text
+        user_states[user_id] = "CAMPAIGN_TARGET"
+        await message.answer("Отправьте ID или ссылку на новый канал с заявками.")
+
+    elif state == "CAMPAIGN_TARGET":
+        temp_data[user_id]["target_channel_id"] = text
+        user_states[user_id] = "CAMPAIGN_REPORT"
+        await message.answer("Отправьте ID или ссылку на канал отчётов (либо «me» для Избранного).")
+
+    elif state == "CAMPAIGN_REPORT":
+        temp_data[user_id]["report_channel_id"] = text
+        user_states[user_id] = "CAMPAIGN_PAUSES"
+        await message.answer("Укажите паузы одобрения: первая|между заявками, например 1-3|25-40. Или «по умолчанию».")
+
+    elif state == "CAMPAIGN_PAUSES":
+        normalized = text.lower().replace(" ", "")
+        try:
+            if normalized in ("поумолчанию", "default", ""):
+                pauses = {"first_min": 1, "first_max": 3, "gap_min": 25, "gap_max": 40}
+            else:
+                a, b = normalized.split("|", 1); amin, amax = a.split("-", 1); bmin, bmax = b.split("-", 1)
+                pauses = {"first_min": int(amin), "first_max": int(amax), "gap_min": int(bmin), "gap_max": int(bmax)}
+                if min(pauses.values()) < 0: raise ValueError
+        except Exception:
+            await message.answer("Неверный формат. Пример: 1-3|25-40."); return
+        temp_data[user_id]["pauses"] = pauses
+        user_states[user_id] = "CAMPAIGN_APPROVER"
+        rows = account_selection_rows("campaign_approver_")
+        await message.answer("Выберите один аккаунт-одобритель:", reply_markup=markup(rows or [[button("Нет включенных аккаунтов", "accounts_menu")]]))
+
+    elif state == "WAIT_NAME":
         config = load_config()
         task_name = sanitize_task_name(text)
 
@@ -458,7 +626,7 @@ async def process_wizard(message: Message):
                 timeout=TELEGRAM_TIMEOUT_SECONDS,
             )
             temp_data[user_id]["telethon_session"] = client_acc.session.save()
-            await list_channels(user_id, message, "target")
+            await after_authorized(user_id, message)
         except SessionPasswordNeededError:
             user_states[user_id] = "WAIT_PASSWORD"
             await message.answer("Введите пароль двухфакторной защиты:")
@@ -480,7 +648,7 @@ async def process_wizard(message: Message):
                 timeout=TELEGRAM_TIMEOUT_SECONDS,
             )
             temp_data[user_id]["telethon_session"] = client_acc.session.save()
-            await list_channels(user_id, message, "target")
+            await after_authorized(user_id, message)
         except asyncio.TimeoutError:
             await message.answer("Telegram долго не отвечает. Отправьте пароль еще раз.")
         except Exception:
@@ -766,7 +934,7 @@ async def wait_for_qr_login(message, status_message, qr_message, user_id, client
         await status_message.edit_text("QR-вход выполнен. Загружаю список каналов...")
         await message.answer("QR-вход выполнен. Загружаю список каналов...")
         logger.info("QR-вход подтвержден для пользователя %s", user_id)
-        await list_channels(user_id, message, "target")
+        await after_authorized(user_id, message)
 
         if qr_message:
             with contextlib.suppress(Exception):
@@ -982,6 +1150,114 @@ async def finish_wizard(message, photo_path):
 async def handle_callback(callback: CallbackQuery):
     data = callback.data or ""
 
+    # New independent account/campaign model. Legacy branches below are kept intact.
+    if data == "accounts_menu":
+        await callback.answer(); await show_accounts_menu(callback); return
+    if data == "legacy_menu":
+        await callback.answer()
+        config = load_config(); rows = [[button(f"{'🟢' if name in active_tasks else '🔴'} {name}", f"view_{name}")] for name in config]
+        rows.append([button("Назад", "back_main")])
+        await callback.message.edit_text("Старые задачи (не входят в кампании)", reply_markup=markup(rows)); return
+    if data == "campaigns_menu":
+        await callback.answer(); await show_campaigns_menu(callback); return
+    if data == "account_add":
+        user_states[callback.from_user.id] = "ACCOUNT_NAME"
+        temp_data[callback.from_user.id] = {"flow": "account", "account_id": new_campaign_id()}
+        await callback.answer(); await callback.message.edit_text("Название подключаемого аккаунта:"); return
+    if data.startswith("account_auth_"):
+        method = data.rsplit("_", 1)[1]; user_id = callback.from_user.id
+        if user_states.get(user_id) != "ACCOUNT_AUTH":
+            await callback.answer("Мастер подключения устарел", show_alert=True); return
+        await callback.answer()
+        if method == "session":
+            user_states[user_id] = "ACCOUNT_SESSION"
+            await callback.message.edit_text("Вставьте готовую строку Telethon StringSession одним сообщением.")
+        elif method == "qr":
+            await start_qr_login(callback.message, user_id)
+        else:
+            await connect_and_request_phone(callback.message, user_id)
+        return
+    if data.startswith("account_view_"):
+        account_id = data.split("account_view_", 1)[1]; account = load_accounts().get(account_id)
+        if not account: await callback.answer("Аккаунт не найден", show_alert=True); return
+        state = "включен" if account.get("enabled", True) else "выключен"
+        info = (f"Аккаунт: {account.get('name', account_id)}\nСтатус: {state}\nПрокси: {redact_proxy(account.get('proxy'))}\n"
+                f"2-е сообщение: {'настроено' if account.get('second_messages') else 'не настроено'}\n"
+                f"3-е сообщение: {'настроено' if account.get('third_messages') else 'не настроено'}")
+        rows = [[button("Выключить" if account.get("enabled", True) else "Включить", f"account_toggle_{account_id}")],
+                [button("2-е сообщение", f"account_second_{account_id}"), button("3-е сообщение", f"account_third_{account_id}")],
+                [button("Прокси", f"account_proxy_{account_id}")], [button("Назад", "accounts_menu")]]
+        await callback.answer(); await callback.message.edit_text(info, reply_markup=markup(rows)); return
+    if data.startswith("account_toggle_"):
+        account_id = data.split("account_toggle_", 1)[1]; registry = load_accounts()
+        if account_id in registry:
+            registry[account_id]["enabled"] = not registry[account_id].get("enabled", True); save_accounts(registry)
+        await callback.answer(); await show_accounts_menu(callback); return
+    if data.startswith(("account_second_", "account_third_", "account_proxy_")):
+        action, account_id = data.split("_", 1)[1].split("_", 1); registry = load_accounts()
+        if account_id not in registry: await callback.answer("Аккаунт не найден", show_alert=True); return
+        if action == "proxy":
+            user_states[callback.from_user.id] = "ACCOUNT_EDIT_PROXY"; temp_data[callback.from_user.id] = {"account_id": account_id}
+            await callback.answer(); await callback.message.edit_text("Введите новый прокси или «нет» для отключения."); return
+        user_states[callback.from_user.id] = "ACCOUNT_SECOND" if action == "second" else "ACCOUNT_THIRD"
+        temp_data[callback.from_user.id] = {"account_id": account_id}
+        await callback.answer(); await callback.message.edit_text("Отправьте варианты текста через символ |."); return
+    if data == "campaign_add":
+        if not load_accounts(): await callback.answer("Сначала подключите хотя бы один аккаунт", show_alert=True); return
+        user_states[callback.from_user.id] = "CAMPAIGN_NAME"; temp_data[callback.from_user.id] = {"campaign_id": new_campaign_id()}
+        await callback.answer(); await callback.message.edit_text("Название новой кампании:"); return
+    if data.startswith("campaign_approver_"):
+        account_id = data.split("campaign_approver_", 1)[1]; user_id = callback.from_user.id
+        if account_id not in load_accounts() or user_states.get(user_id) != "CAMPAIGN_APPROVER": await callback.answer("Выбор устарел", show_alert=True); return
+        temp_data[user_id]["approver_account_id"] = account_id; temp_data[user_id]["sender_account_ids"] = []
+        user_states[user_id] = "CAMPAIGN_SENDERS"
+        await callback.answer(); await callback.message.edit_text("Выберите аккаунты рассылки (можно несколько):", reply_markup=markup(account_selection_rows("campaign_sender_", set(), True))); return
+    if data.startswith("campaign_sender_"):
+        user_id = callback.from_user.id
+        if user_states.get(user_id) != "CAMPAIGN_SENDERS": await callback.answer("Выбор устарел", show_alert=True); return
+        account_id = data.split("campaign_sender_", 1)[1]; chosen = set(temp_data[user_id].get("sender_account_ids", []))
+        if account_id in chosen: chosen.remove(account_id)
+        else: chosen.add(account_id)
+        temp_data[user_id]["sender_account_ids"] = list(chosen)
+        await callback.answer(); await callback.message.edit_reply_markup(reply_markup=markup(account_selection_rows("campaign_sender_", chosen, True))); return
+    if data == "campaign_senders_done":
+        user_id = callback.from_user.id; draft = temp_data.get(user_id, {})
+        if not draft.get("sender_account_ids"): await callback.answer("Выберите хотя бы один аккаунт", show_alert=True); return
+        campaign_id = draft["campaign_id"]
+        def channel(value):
+            if value == "me": return value
+            try: return int(value)
+            except (TypeError, ValueError): return value
+        all_campaigns = load_campaigns(); all_campaigns[campaign_id] = {"id": campaign_id, "name": draft["campaign_name"], "target_channel_id": channel(draft["target_channel_id"]), "report_channel_id": channel(draft["report_channel_id"]), "approver_account_id": draft["approver_account_id"], "sender_account_ids": draft["sender_account_ids"], "pauses": draft["pauses"], "enabled": False}
+        save_campaigns(all_campaigns); await cleanup_user(user_id)
+        await callback.answer("Кампания создана"); await show_campaigns_menu(callback); return
+    if data.startswith("campaign_view_"):
+        campaign_id = data.split("campaign_view_", 1)[1]; campaign = load_campaigns().get(campaign_id)
+        if not campaign: await callback.answer("Кампания не найдена", show_alert=True); return
+        registry = load_accounts(); approver = registry.get(campaign.get("approver_account_id"), {}).get("name", "не найден")
+        senders = [registry.get(a, {}).get("name", a) for a in campaign.get("sender_account_ids", [])]
+        info = f"Кампания: {campaign.get('name')}\nКанал: {campaign.get('target_channel_id')}\nОдобряет: {approver}\nРассылка: {', '.join(senders) or '—'}\nРучная очередь: {campaign_store.pending_count(campaign_id)}"
+        running = campaign_id in active_campaigns
+        rows = [[button("Остановить" if running else "Запустить", f"campaign_stop_{campaign_id}" if running else f"campaign_start_{campaign_id}")], [button("Обработать старые ответы", f"campaign_old_replies_{campaign_id}")], [button("Обработать старые заявки", f"campaign_old_requests_{campaign_id}")], [button("Назад", "campaigns_menu")]]
+        await callback.answer(); await callback.message.edit_text(info, reply_markup=markup(rows)); return
+    if data.startswith(("campaign_start_", "campaign_stop_", "campaign_old_replies_", "campaign_old_requests_")):
+        parts = data.split("_"); action = "_".join(parts[1:-1]); campaign_id = parts[-1]
+        definitions = load_campaigns(); definition = definitions.get(campaign_id)
+        if not definition: await callback.answer("Кампания не найдена", show_alert=True); return
+        if action == "start":
+            await callback.answer(); await callback.message.edit_text("Подключаю аккаунты кампании…")
+            worker = CampaignWorker(campaign_id, definition); ok, result = await worker.start()
+            if ok: definitions[campaign_id]["enabled"] = True; save_campaigns(definitions)
+            await callback.message.edit_text(result); await asyncio.sleep(1); await show_campaigns_menu(callback); return
+        if action == "stop":
+            if campaign_id in active_campaigns: await active_campaigns[campaign_id].stop()
+            definitions[campaign_id]["enabled"] = False; save_campaigns(definitions); await callback.answer("Остановлено"); await show_campaigns_menu(callback); return
+        worker = active_campaigns.get(campaign_id)
+        if not worker: await callback.answer("Сначала запустите кампанию", show_alert=True); return
+        await callback.answer("Запущено")
+        asyncio.create_task(worker.process_old_replies() if action == "old_replies" else worker.process_old_requests())
+        await callback.message.answer("Разовая обработка запущена. Результат появится в канале отчётов."); return
+
     if data in ("refresh", "back_main"):
         await callback.answer()
         await show_main_menu(callback)
@@ -1167,15 +1443,37 @@ async def stop_active_tasks():
             active_tasks.pop(task_name, None)
 
 
+async def restore_enabled_campaigns():
+    for campaign_id, definition in load_campaigns().items():
+        if not definition.get("enabled") or campaign_id in active_campaigns:
+            continue
+        worker = CampaignWorker(campaign_id, definition)
+        success, result = await worker.start()
+        if not success:
+            logger.warning("Не удалось восстановить кампанию %s: %s", campaign_id, result)
+            data = load_campaigns()
+            if campaign_id in data:
+                data[campaign_id]["enabled"] = False
+                save_campaigns(data)
+
+
+async def stop_active_campaigns():
+    for campaign_id, worker in list(active_campaigns.items()):
+        with contextlib.suppress(Exception):
+            await worker.stop()
+
+
 async def main():
     logger.info("Админ-бот Bot API запускается")
     await admin_bot.delete_webhook(drop_pending_updates=False)
     await restore_enabled_tasks()
+    await restore_enabled_campaigns()
 
     try:
         await dp.start_polling(admin_bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await stop_active_tasks()
+        await stop_active_campaigns()
         await admin_bot.session.close()
 
 
