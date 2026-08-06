@@ -175,6 +175,10 @@ class CampaignWorker:
             return
         self.in_progress.add(user_id)
         try:
+            pauses = self.data.get("pauses") or {}
+            reply_min = max(0, int(pauses.get("reply_min", 1)))
+            reply_max = max(0, int(pauses.get("reply_max", 3)))
+            await asyncio.sleep(random.randint(*sorted((reply_min, reply_max))) * 60)
             await self.senders[account_id].send_message(user_id, random.choice(messages))
             if store.mark_once(self.id, user_id, 2):
                 await self.report(f"Ответ обработан\nКлиент: {label or user_id}\n2-е сообщение: отправлено с «{account.get('name', account_id)}»")
@@ -253,6 +257,10 @@ class CampaignWorker:
         if binding["third_sent_at"]:
             return "не отправлено: 3-е сообщение уже отправлено"
         try:
+            pauses = self.data.get("pauses") or {}
+            third_min = max(0, int(pauses.get("third_min", 1)))
+            third_max = max(0, int(pauses.get("third_max", 3)))
+            await asyncio.sleep(random.randint(*sorted((third_min, third_max))) * 60)
             await sender.send_message(user_id, random.choice(messages))
             return f"отправлено с «{account.get('name', account_id)}»" if store.mark_once(self.id, user_id, 3) else "не отправлено: уже было отправлено"
         except Exception as exc:

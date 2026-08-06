@@ -533,16 +533,16 @@ async def process_wizard(message: Message):
     elif state == "CAMPAIGN_REPORT":
         temp_data[user_id]["report_channel_id"] = text
         user_states[user_id] = "CAMPAIGN_PAUSES"
-        await message.answer("Укажите паузы одобрения: первая|между заявками, например 1-3|25-40. Или «по умолчанию».")
+        await message.answer("Укажите паузы одобрения: первая|между заявками, например 1-3|25-40. Или «по умолчанию».\n\nСообщения после ответа и после одобрения уходят с паузой 1–3 минуты.")
 
     elif state == "CAMPAIGN_PAUSES":
         normalized = text.lower().replace(" ", "")
         try:
             if normalized in ("поумолчанию", "default", ""):
-                pauses = {"first_min": 1, "first_max": 3, "gap_min": 25, "gap_max": 40}
+                pauses = {"reply_min": 1, "reply_max": 3, "third_min": 1, "third_max": 3, "first_min": 1, "first_max": 3, "gap_min": 25, "gap_max": 40}
             else:
                 a, b = normalized.split("|", 1); amin, amax = a.split("-", 1); bmin, bmax = b.split("-", 1)
-                pauses = {"first_min": int(amin), "first_max": int(amax), "gap_min": int(bmin), "gap_max": int(bmax)}
+                pauses = {"reply_min": 1, "reply_max": 3, "third_min": 1, "third_max": 3, "first_min": int(amin), "first_max": int(amax), "gap_min": int(bmin), "gap_max": int(bmax)}
                 if min(pauses.values()) < 0: raise ValueError
         except Exception:
             await message.answer("Неверный формат. Пример: 1-3|25-40."); return
