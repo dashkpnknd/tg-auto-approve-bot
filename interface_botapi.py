@@ -215,6 +215,8 @@ def redact_proxy(proxy):
 
 
 def describe_route(proxy):
+    if proxy is False:
+        return "без прокси"
     if proxy:
         return redact_proxy(proxy)
 
@@ -226,6 +228,8 @@ def describe_route(proxy):
 
 
 def to_telethon_proxy(proxy):
+    if proxy is False:
+        return None
     if not proxy:
         return None
 
@@ -463,7 +467,9 @@ async def process_wizard(message: Message):
 
     if state == "ACCOUNT_PROXY":
         try:
-            temp_data[user_id]["proxy"] = None if text.lower() in ("нет", "no", "-") else parse_proxy(text)
+            # False is an explicit direct route. None retains legacy behaviour
+            # where an old single-account task may use the server default.
+            temp_data[user_id]["proxy"] = False if text.lower() in ("нет", "no", "-") else parse_proxy(text)
         except Exception:
             await message.answer("Неверный прокси. Повторите ввод или отправьте «нет».")
             return
