@@ -523,6 +523,18 @@ async def process_wizard(message: Message):
         save_accounts(registry); await cleanup_user(user_id)
         await message.answer("Прокси сохранён. Он будет применён при следующем запуске кампании.")
 
+    elif state == "CAMPAIGN_THIRD_FORWARD":
+        if not getattr(message, "forward_origin", None) or not message.html_text:
+            await message.answer("Перешлите сюда готовое 3-е сообщение из Telegram — так сохранятся ссылки, цитаты и оформление.")
+            return
+        registry = load_accounts()
+        content = {"html": message.html_text}
+        for account in registry.values():
+            account["third_messages"] = [content]
+        save_accounts(registry)
+        await cleanup_user(user_id)
+        await message.answer("✅ 3-е сообщение сохранено для всех 4 аккаунтов. Кампания остаётся выключенной.")
+
     elif state == "CAMPAIGN_NAME":
         if not text or len(text) > 80:
             await message.answer("Укажите название кампании до 80 символов."); return
@@ -1219,6 +1231,12 @@ async def handle_callback(callback: CallbackQuery):
         if not load_accounts(): await callback.answer("Сначала подключите хотя бы один аккаунт", show_alert=True); return
         user_states[callback.from_user.id] = "CAMPAIGN_NAME"; temp_data[callback.from_user.id] = {"campaign_id": new_campaign_id()}
         await callback.answer(); await callback.message.edit_text("Название новой кампании:"); return
+    if data == "campaign_set_third":
+        user_states[callback.from_user.id] = "CAMPAIGN_THIRD_FORWARD"
+        temp_data[callback.from_user.id] = {"campaign_id": "ai_tenders_20260806"}
+        await callback.answer()
+        await callback.message.edit_text("Перешлите сюда готовое 3-е сообщение целиком.\n\nСсылки, цитаты и оформление сохранятся. Оно будет применено ко всем аккаунтам.")
+        return
     if data.startswith("campaign_approver_"):
         account_id = data.split("campaign_approver_", 1)[1]; user_id = callback.from_user.id
         if account_id not in load_accounts() or user_states.get(user_id) != "CAMPAIGN_APPROVER": await callback.answer("Выбор устарел", show_alert=True); return
@@ -1251,7 +1269,7 @@ async def handle_callback(callback: CallbackQuery):
         senders = [registry.get(a, {}).get("name", a) for a in campaign.get("sender_account_ids", [])]
         info = f"Кампания: {campaign.get('name')}\nКанал: {campaign.get('target_channel_id')}\nОдобряет: {approver}\nРассылка: {', '.join(senders) or '—'}\nРучная очередь: {campaign_store.pending_count(campaign_id)}"
         running = campaign_id in active_campaigns
-        rows = [[button("Остановить" if running else "Запустить", f"campaign_stop_{campaign_id}" if running else f"campaign_start_{campaign_id}")], [button("Обработать старые ответы", f"campaign_old_replies_{campaign_id}")], [button("Обработать старые заявки", f"campaign_old_requests_{campaign_id}")], [button("Назад", "campaigns_menu")]]
+        rows = [[button("Остановить" if running else "Запустить", f"campaign_stop_{campaign_id}" if running else f"campaign_start_{campaign_id}")], [button("Переслать 3-е сообщение", "campaign_set_third")], [button("Обработать старые ответы", f"campaign_old_replies_{campaign_id}")], [button("Обработать старые заявки", f"campaign_old_requests_{campaign_id}")], [button("Назад", "campaigns_menu")]]
         await callback.answer(); await callback.message.edit_text(info, reply_markup=markup(rows)); return
     if data.startswith(("campaign_start_", "campaign_stop_", "campaign_old_replies_", "campaign_old_requests_")):
         parts = data.split("_"); action = "_".join(parts[1:-1]); campaign_id = parts[-1]
