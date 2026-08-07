@@ -170,7 +170,7 @@ class CampaignWorker:
                     return await client.get_input_entity(dialog.entity)
         return None
 
-    async def ensure_second(self, user_id, account_id, label=""):
+    async def ensure_second(self, user_id, account_id, label="", peer=None):
         binding = store.binding(self.id, user_id)
         if not binding or binding["account_id"] != account_id or binding["second_sent_at"]:
             return
@@ -189,6 +189,8 @@ class CampaignWorker:
             reply_max = max(0, int(pauses.get("reply_max", 3)))
             await asyncio.sleep(random.randint(*sorted((reply_min, reply_max))) * 60)
             await send_campaign_message(self.senders[account_id], user_id, random.choice(messages))
+            with contextlib.suppress(Exception):
+                await self.senders[account_id].send_read_acknowledge(peer or user_id)
             if store.mark_once(self.id, user_id, 2):
                 await self.report(f"Ответ обработан\nКлиент: {label or user_id}\n2-е сообщение: отправлено с «{account.get('name', account_id)}»")
         except Exception as exc:
@@ -210,7 +212,7 @@ class CampaignWorker:
                 store.queue(self.id, user_id, "multiple_sender_accounts", f"{binding['account_id']}, {account_id}")
                 await self.report(f"Ручная очередь\nКлиент: {getattr(chat, 'first_name', '')} ({user_id})\nПричина: ответ найден в нескольких аккаунтах")
                 return
-            await self.ensure_second(user_id, account_id, getattr(chat, "first_name", ""))
+            await self.ensure_second(user_id, account_id, getattr(chat, "first_name", ""), chat)
         return handler
 
     async def enqueue(self, peer, user_id):
@@ -271,6 +273,8 @@ class CampaignWorker:
             third_max = max(0, int(pauses.get("third_max", 3)))
             await asyncio.sleep(random.randint(*sorted((third_min, third_max))) * 60)
             await send_campaign_message(sender, user_id, random.choice(messages))
+            with contextlib.suppress(Exception):
+                await sender.send_read_acknowledge(user_id)
             return f"отправлено с «{account.get('name', account_id)}»" if store.mark_once(self.id, user_id, 3) else "не отправлено: уже было отправлено"
         except Exception as exc:
             store.queue(self.id, user_id, "third_message_error", str(exc)[:300])
@@ -350,7 +354,7 @@ class CampaignWorker:
                 if binding["account_id"] != account_id:
                     store.queue(self.id, user_id, "multiple_sender_accounts", "old reply scan")
                     continue
-                await self.ensure_second(user_id, account_id, getattr(entity, "first_name", "")); found += 1
+                await self.ensure_second(user_id, account_id, getattr(entity, "first_name", ""), entity); found += 1
         await self.report(f"Разовая обработка ответов завершена\nПроверено непрочитанных диалогов: {found}")
 
     async def process_old_requests(self):
