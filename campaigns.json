@@ -1,0 +1,28 @@
+{
+  "ai_tenders_20260806": {
+    "id": "ai_tenders_20260806",
+    "name": "AI РАЗБОР ТЕНДЕРОВ",
+    "target_channel_id": -1003638134974,
+    "report_channel_id": -1004431634484,
+    "approver_account_id": "52f4c4540ed64d62",
+    "sender_account_ids": [
+      "52f4c4540ed64d62",
+      "27443ee1f6714ac4",
+      "8fe240df06a44c45",
+      "5309254ecf714357"
+    ],
+    "pauses": {
+      "reply_min": 1,
+      "reply_max": 3,
+      "third_min": 1,
+      "third_max": 3,
+      "first_min": 1,
+      "first_max": 3,
+      "gap_min": 1,
+      "gap_max": 3,
+      "dialog_gap_min": 20,
+      "dialog_gap_max": 30
+    },
+    "enabled": true
+  }
+}

@@ -150,6 +150,10 @@ class CampaignWorker:
         self.pending, self.processed, self.in_progress = set(), set(), set()
         self.last_approval = None
         self.target_peer = None
+        # A single account may continue an existing conversation immediately,
+        # but must not hop from one client to another in a bulk-like pattern.
+        self.sender_locks = {}
+        self.sender_last_dialog = {}
 
     @property
     def report_id(self): return self.data.get("report_channel_id")
@@ -170,6 +174,25 @@ class CampaignWorker:
                     return await client.get_input_entity(dialog.entity)
         return None
 
+    async def wait_for_new_dialog(self, account_id, user_id):
+        """Serialize sends per account and pause only when the recipient changes."""
+        lock = self.sender_locks.setdefault(account_id, asyncio.Lock())
+        await lock.acquire()
+        previous = self.sender_last_dialog.get(account_id)
+        if previous and previous[0] != user_id:
+            pauses = self.data.get("pauses") or {}
+            minimum = max(0, int(pauses.get("dialog_gap_min", 20))) * 60
+            maximum = max(0, int(pauses.get("dialog_gap_max", 30))) * 60
+            elapsed = (datetime.utcnow() - previous[1]).total_seconds()
+            wait = max(0, random.randint(*sorted((minimum, maximum))) - elapsed)
+            if wait:
+                await asyncio.sleep(wait)
+        return lock
+
+    def finish_dialog_action(self, account_id, user_id, lock):
+        self.sender_last_dialog[account_id] = (user_id, datetime.utcnow())
+        lock.release()
+
     async def ensure_second(self, user_id, account_id, label="", peer=None):
         binding = store.binding(self.id, user_id)
         if not binding or binding["account_id"] != account_id:
@@ -187,11 +210,13 @@ class CampaignWorker:
         if user_id in self.in_progress:
             return
         self.in_progress.add(user_id)
+        dialog_lock = None
         try:
             pauses = self.data.get("pauses") or {}
             reply_min = max(0, int(pauses.get("reply_min", 1)))
             reply_max = max(0, int(pauses.get("reply_max", 3)))
             await asyncio.sleep(random.randint(*sorted((reply_min, reply_max))) * 60)
+            dialog_lock = await self.wait_for_new_dialog(account_id, user_id)
             await send_campaign_message(self.senders[account_id], user_id, random.choice(messages))
             with contextlib.suppress(Exception):
                 await self.senders[account_id].send_read_acknowledge(peer or user_id)
@@ -201,6 +226,8 @@ class CampaignWorker:
             store.queue(self.id, user_id, "second_message_error", str(exc)[:300])
             await self.report(f"Ручная очередь\nКлиент: {label or user_id}\nПричина: не удалось отправить 2-е сообщение")
         finally:
+            if dialog_lock:
+                self.finish_dialog_action(account_id, user_id, dialog_lock)
             self.in_progress.discard(user_id)
 
     def message_handler(self, account_id):
@@ -271,11 +298,13 @@ class CampaignWorker:
             return "не отправлено: не задано 3-е сообщение"
         if binding["third_sent_at"]:
             return "не отправлено: 3-е сообщение уже отправлено"
+        dialog_lock = None
         try:
             pauses = self.data.get("pauses") or {}
             third_min = max(0, int(pauses.get("third_min", 1)))
             third_max = max(0, int(pauses.get("third_max", 3)))
             await asyncio.sleep(random.randint(*sorted((third_min, third_max))) * 60)
+            dialog_lock = await self.wait_for_new_dialog(account_id, user_id)
             await send_campaign_message(sender, user_id, random.choice(messages))
             with contextlib.suppress(Exception):
                 await sender.send_read_acknowledge(user_id)
@@ -283,6 +312,9 @@ class CampaignWorker:
         except Exception as exc:
             store.queue(self.id, user_id, "third_message_error", str(exc)[:300])
             return "ошибка отправки, передано вручную"
+        finally:
+            if dialog_lock:
+                self.finish_dialog_action(account_id, user_id, dialog_lock)
 
     async def work(self):
         pauses = self.data.get("pauses") or {}
