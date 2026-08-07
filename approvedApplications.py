@@ -441,18 +441,6 @@ class AutoApproveWorker:
         self.known_dialog_users.add(user_id)
         return True
 
-    async def send_message_with_configured_photo(self, user_id, text):
-        """Send the legacy post-approval message, always, even in an old dialog."""
-        if self.photo_path and os.path.exists(self.photo_path):
-            if len(text) <= MAX_PHOTO_CAPTION_LENGTH:
-                return await self.send_photo_safe(user_id, self.photo_path, caption=text)
-            await self.send_photo_safe(user_id, self.photo_path)
-            return await self.send_message_safe(user_id, text)
-
-        if self.photo_path:
-            logger.warning("[%s] Фото не найдено: %s", self.task_name, self.photo_path)
-        return await self.send_message_safe(user_id, text)
-
     async def report(self, text):
         logger.info("[%s] %s", self.task_name, text)
 
@@ -579,7 +567,9 @@ class AutoApproveWorker:
             return "не отправлено: 3-е сообщение уже отправлялось"
 
         try:
-            await sender.send_message_with_configured_photo(user_id, random.choice(sender.messages))
+            sent = await sender.send_greeting_if_needed(user_id, random.choice(sender.messages))
+            if not sent:
+                return "не отправлено: с клиентом уже есть личный диалог"
             if binding_store.mark_sent_once(user_id, 3):
                 return f"3-е сообщение отправлено с аккаунта {binding['task_name']}"
             return "не отправлено: 3-е сообщение уже отправлялось"
