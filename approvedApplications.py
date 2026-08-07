@@ -526,37 +526,19 @@ class AutoApproveWorker:
             )
 
     async def send_third_from_bound_account(self, user_id, user_label):
-        binding = binding_store.binding(user_id)
-        if not binding:
-            candidates = [worker for worker in active_workers.values() if user_id in worker.known_dialog_users]
-            if len(candidates) == 1:
-                binding = binding_store.bind_if_absent(user_id, candidates[0].task_name)
-                logger.info("Клиент %s автоматически привязан к аккаунту %s по существующему диалогу", user_id, candidates[0].task_name)
-            else:
-                details = "нет диалога" if not candidates else "несколько аккаунтов: " + ", ".join(worker.task_name for worker in candidates)
-                binding_store.queue_manual(user_id, "sender_not_bound", details)
-                return "не отправлено: нет однозначной привязки к рассылочному аккаунту, передано вручную"
-
-        sender = active_workers.get(binding["task_name"])
-        if not sender or not sender.is_running:
-            binding_store.queue_manual(user_id, "sender_account_unavailable", binding["task_name"])
-            return "не отправлено: привязанный аккаунт недоступен, передано вручную"
-        if not sender.messages:
-            binding_store.queue_manual(user_id, "third_message_not_configured", binding["task_name"])
-            return "не отправлено: для привязанного аккаунта не задано 3-е сообщение"
-        if binding["third_sent_at"]:
-            return "не отправлено: 3-е сообщение уже отправлялось"
+        """Old one-account task: send its only message only to an empty dialog."""
+        if not self.messages:
+            binding_store.queue_manual(user_id, "legacy_message_not_configured", self.task_name)
+            return "не отправлено: для задачи не задано сообщение"
 
         try:
-            sent = await sender.send_greeting_if_needed(user_id, random.choice(sender.messages))
+            sent = await self.send_greeting_if_needed(user_id, random.choice(self.messages))
             if not sent:
                 return "не отправлено: с клиентом уже есть личный диалог"
-            if binding_store.mark_sent_once(user_id, 3):
-                return f"3-е сообщение отправлено с аккаунта {binding['task_name']}"
-            return "не отправлено: 3-е сообщение уже отправлялось"
+            return f"фото и сообщение отправлены с аккаунта {self.task_name}"
         except Exception:
-            logger.exception("[%s] Не удалось отправить 3-е сообщение пользователю %s", sender.task_name, user_id)
-            binding_store.queue_manual(user_id, "third_message_error", sender.task_name)
+            logger.exception("[%s] Не удалось отправить сообщение пользователю %s", self.task_name, user_id)
+            binding_store.queue_manual(user_id, "legacy_message_error", self.task_name)
             return "ошибка отправки, передано вручную"
 
     async def scan_pending_requests(self, is_startup=False):
