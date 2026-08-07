@@ -311,7 +311,7 @@ class AutoApproveWorker:
         self.app.add_event_handler(self.handle_dialog_message, events.NewMessage)
 
     async def handle_dialog_message(self, event):
-        """Remember the account that opened a dialogue and send stage 2 once."""
+        """Legacy one-account tasks never send a second message on a reply."""
         if not event.is_private:
             return
         try:
@@ -320,29 +320,10 @@ class AutoApproveWorker:
                 return
             user_id = event.chat_id
             if event.out:
-                # The first outbound private message fixes the account forever.
+                # Remember only the owner of the dialog for the old-task flow.
                 binding_store.bind_if_absent(user_id, self.task_name, event.message.id)
-                return
-
-            binding = binding_store.binding(user_id)
-            if not binding or binding["task_name"] != self.task_name:
-                return
-            if not self.second_messages:
-                binding_store.queue_manual(user_id, "second_message_not_configured", self.task_name)
-                await self.report(f"Ручная обработка\nПользователь: {user_report_label(user_id, peer)}\nПричина: для задачи {self.task_name} не задано 2-е сообщение")
-                return
-            if binding["second_sent_at"] or user_id in self.second_messages_in_progress:
-                return
-            self.second_messages_in_progress.add(user_id)
-            try:
-                await self.send_message_safe(user_id, random.choice(self.second_messages))
-                binding_store.mark_sent_once(user_id, 2)
-                await self.report(f"Диалог\nПользователь: {user_report_label(user_id, peer)}\nСтатус: 2-е сообщение отправлено с аккаунта {self.task_name}")
-            finally:
-                self.second_messages_in_progress.discard(user_id)
         except Exception:
-            logger.exception("[%s] Не удалось обработать сообщение диалога", self.task_name)
-            binding_store.queue_manual(getattr(locals().get("peer"), "id", 0), "second_message_error", self.task_name)
+            logger.exception("[%s] Не удалось запомнить диалог", self.task_name)
 
     async def resolve_peer(self, chat_id):
         if chat_id == "me":
