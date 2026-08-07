@@ -172,7 +172,11 @@ class CampaignWorker:
 
     async def ensure_second(self, user_id, account_id, label="", peer=None):
         binding = store.binding(self.id, user_id)
-        if not binding or binding["account_id"] != account_id or binding["second_sent_at"]:
+        if not binding or binding["account_id"] != account_id:
+            return
+        if binding["second_sent_at"]:
+            with contextlib.suppress(Exception):
+                await self.senders[account_id].send_read_acknowledge(peer or user_id)
             return
         account = self.accounts.get(account_id, {})
         messages = account.get("second_messages") or []
