@@ -284,8 +284,18 @@ class CampaignWorker:
     async def send_third(self, user_id):
         binding = store.binding(self.id, user_id)
         if not binding:
-            store.queue(self.id, user_id, "sender_not_bound")
-            return "не отправлено: нет привязанного рассылочного аккаунта"
+            # A person may apply without replying to the first mailing.  In
+            # that case the campaign uses its explicitly chosen fallback
+            # sender, rather than leaving the person without a follow-up.
+            fallback_id = self.data.get("unbound_fallback_account_id")
+            if not fallback_id or fallback_id not in self.senders or fallback_id not in self.accounts:
+                store.queue(self.id, user_id, "sender_not_bound")
+                return "не отправлено: нет привязанного рассылочного аккаунта"
+            binding = store.bind(self.id, user_id, fallback_id)
+            await self.report(
+                f"Заявка без ответа на рассылку\nКлиент: {user_id}\n"
+                f"Для 3-го сообщения выбран резервный аккаунт «{self.accounts[fallback_id].get('name', fallback_id)}»"
+            )
         account_id = binding["account_id"]
         account = self.accounts.get(account_id)
         sender = self.senders.get(account_id)

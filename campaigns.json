@@ -5,6 +5,7 @@
     "target_channel_id": -1003638134974,
     "report_channel_id": -1004431634484,
     "approver_account_id": "52f4c4540ed64d62",
+    "unbound_fallback_account_id": "27443ee1f6714ac4",
     "sender_account_ids": [
       "52f4c4540ed64d62",
       "27443ee1f6714ac4",
