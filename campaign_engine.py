@@ -131,10 +131,17 @@ def client_for(account):
 
 
 async def send_campaign_message(client, chat_id, content):
-    """Send plain text or Bot API HTML captured from a forwarded message."""
-    if isinstance(content, dict) and content.get("html"):
-        text, entities = html.parse(content["html"])
-        return await client.send_message(chat_id, text, formatting_entities=entities)
+    """Send text or the exact text-and-photo combination saved through the bot."""
+    if isinstance(content, dict):
+        text, entities = html.parse(content.get("html", ""))
+        photo_path = content.get("photo_path")
+        if photo_path and os.path.isfile(photo_path):
+            return await client.send_file(
+                chat_id, photo_path, caption=text or None,
+                formatting_entities=entities or None,
+            )
+        if content.get("html"):
+            return await client.send_message(chat_id, text, formatting_entities=entities)
     return await client.send_message(chat_id, content)
 
 
