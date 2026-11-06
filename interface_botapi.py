@@ -121,10 +121,18 @@ def save_config(data):
 def set_task_enabled(task_name, enabled):
     config = load_config()
     if task_name not in config:
-        return
+        return False
+
+    if not enabled and config[task_name].get("always_enabled"):
+        logger.warning(
+            "Отключение постоянно активной задачи заблокировано: %s",
+            task_name,
+        )
+        return False
 
     config[task_name]["enabled"] = enabled
     save_config(config)
+    return True
 
 
 def get_unique_sessions():
@@ -734,9 +742,9 @@ async def process_wizard(message: Message):
         temp_data[user_id]["messages"] = messages
         user_states[user_id] = "WAIT_PAUSES"
         await message.answer(
-            "Шаг 6\nУкажите паузы в минутах\n"
-            "Формат: 3-10|25-40\n"
-            "первая задержка | интервал между одобрениями\n"
+            "Шаг 6\nУкажите паузы для сообщений в секундах\n"
+            "Формат: 30-600|1800\n"
+            "задержка сообщения после одобрения | минимальный интервал между сообщениями\n"
             "Или отправьте: по умолчанию"
         )
 
@@ -745,24 +753,25 @@ async def process_wizard(message: Message):
 
         if normalized in ["default", "поумолчанию", "по_умолчанию", "стандарт", ""]:
             temp_data[user_id]["pauses"] = {
-                "first_min": 3,
-                "first_max": 10,
-                "gap_min": 25,
-                "gap_max": 40,
+                "message_delay_min_seconds": 30,
+                "message_delay_max_seconds": 600,
+                "message_gap_min_seconds": 1800,
+                "message_gap_max_seconds": 1800,
             }
         else:
             try:
-                first_part, gap_part = normalized.split("|", 1)
-                first_min, first_max = first_part.split("-", 1)
-                gap_min, gap_max = gap_part.split("-", 1)
+                delay_part, gap_part = normalized.split("|", 1)
+                delay_min, delay_max = delay_part.split("-", 1)
                 temp_data[user_id]["pauses"] = {
-                    "first_min": int(first_min),
-                    "first_max": int(first_max),
-                    "gap_min": int(gap_min),
-                    "gap_max": int(gap_max),
+                    "message_delay_min_seconds": int(delay_min),
+                    "message_delay_max_seconds": int(delay_max),
+                    "message_gap_min_seconds": int(gap_part),
+                    "message_gap_max_seconds": int(gap_part),
                 }
+                if min(temp_data[user_id]["pauses"].values()) < 0:
+                    raise ValueError
             except Exception:
-                await message.answer("Неверный формат. Пример: 3-10|25-40 или по умолчанию.")
+                await message.answer("Неверный формат. Пример: 30-600|1800 или по умолчанию.")
                 return
 
         user_states[user_id] = "WAIT_PHOTO"
@@ -1332,22 +1341,19 @@ async def handle_callback(callback: CallbackQuery):
 
         status = "РАБОТАЕТ" if task_name in active_tasks else "ОСТАНОВЛЕНА"
         session_name = config.get("session_file", task_name)
-        pauses = config.get("pauses") or {
-            "first_min": 3,
-            "first_max": 10,
-            "gap_min": 25,
-            "gap_max": 40,
-        }
+        pauses = config.get("pauses") or {}
         pauses_text = (
-            f"{pauses.get('first_min', 3)}-{pauses.get('first_max', 10)}|"
-            f"{pauses.get('gap_min', 25)}-{pauses.get('gap_max', 40)}"
+            f"{pauses.get('message_delay_min_seconds', 30)}-"
+            f"{pauses.get('message_delay_max_seconds', 600)} сек. после одобрения; "
+            f"не чаще {pauses.get('message_gap_min_seconds', 1800)} сек."
         )
 
         info = (
             f"Задача: {task_name}\n"
             f"Статус: {status}\n"
             f"Аккаунт: {session_name}\n"
-            f"Паузы: {pauses_text}\n"
+            "Одобрение: сразу\n"
+            f"Сообщения: {pauses_text}\n"
             f"2-е сообщение: {'настроено' if config.get('second_messages') else 'не настроено'}\n"
             f"3-е сообщение: {'настроено' if config.get('messages') else 'не настроено'}"
         )
@@ -1429,6 +1435,13 @@ async def handle_callback(callback: CallbackQuery):
     if data.startswith("stop_"):
         task_name = data.split("_", 1)[1]
 
+        if load_config().get(task_name, {}).get("always_enabled"):
+            await callback.answer(
+                "Эта задача постоянно активна и не может быть отключена.",
+                show_alert=True,
+            )
+            return
+
         if task_name in active_tasks:
             await active_tasks.pop(task_name).stop()
 
@@ -1438,6 +1451,13 @@ async def handle_callback(callback: CallbackQuery):
 
     if data.startswith("del_"):
         task_name = data.split("_", 1)[1]
+
+        if load_config().get(task_name, {}).get("always_enabled"):
+            await callback.answer(
+                "Эта задача постоянно активна и не может быть удалена.",
+                show_alert=True,
+            )
+            return
 
         if task_name in active_tasks:
             await active_tasks.pop(task_name).stop()
