@@ -14,6 +14,8 @@ from telethon import TelegramClient, events, functions, types, utils
 from telethon.errors import FloodWaitError, RPCError
 from telethon.sessions import StringSession
 
+from analytics_events import record_event
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -125,21 +127,6 @@ def normalize_pause_range(pauses, min_key, max_key, default_min, default_max):
     except (TypeError, ValueError):
         min_seconds = default_min * 60
         max_seconds = default_max * 60
-
-    if min_seconds > max_seconds:
-        min_seconds, max_seconds = max_seconds, min_seconds
-
-    return min_seconds, max_seconds
-
-
-def normalize_seconds_range(pauses, min_key, max_key, default_min, default_max):
-    """Read a delay already expressed in seconds, preserving a valid range."""
-    try:
-        min_seconds = max(0, int(pauses.get(min_key, default_min)))
-        max_seconds = max(0, int(pauses.get(max_key, default_max)))
-    except (TypeError, ValueError):
-        min_seconds = default_min
-        max_seconds = default_max
 
     if min_seconds > max_seconds:
         min_seconds, max_seconds = max_seconds, min_seconds
@@ -287,27 +274,25 @@ class AutoApproveWorker:
         self.session_string = telethon_session or ""
 
         pauses = pauses or {}
-        self.message_delay_min_seconds, self.message_delay_max_seconds = normalize_seconds_range(
+        self.first_min_seconds, self.first_max_seconds = normalize_pause_range(
             pauses,
-            "message_delay_min_seconds",
-            "message_delay_max_seconds",
-            30,
-            10 * 60,
+            "first_min",
+            "first_max",
+            3,
+            10,
         )
-        self.message_gap_min_seconds, self.message_gap_max_seconds = normalize_seconds_range(
+        self.gap_min_seconds, self.gap_max_seconds = normalize_pause_range(
             pauses,
-            "message_gap_min_seconds",
-            "message_gap_max_seconds",
-            30 * 60,
-            30 * 60,
+            "gap_min",
+            "gap_max",
+            25,
+            40,
         )
 
         self.request_queue = asyncio.Queue()
         self.pending_users = set()
         self.processed_users = set()
-        self.last_message_time = None
-        self.message_send_lock = asyncio.Lock()
-        self.message_tasks = set()
+        self.last_approval_time = None
         self.daily_count = 0
         self.known_dialog_users = set()
         self.second_messages_in_progress = set()
@@ -473,20 +458,48 @@ class AutoApproveWorker:
             self.daily_count = 0
             await asyncio.sleep(60)
 
-    async def enqueue_request(self, chat_peer, user_id, user_label):
+    async def enqueue_request(self, chat_peer, user_id, user_label, event_payload):
         if user_id in self.pending_users or user_id in self.processed_users:
             return False
 
         self.pending_users.add(user_id)
-        await self.request_queue.put((chat_peer, user_id, user_label))
+        await self.request_queue.put((chat_peer, user_id, user_label, event_payload))
+        await record_event(
+            self.task_name,
+            "join_request",
+            f"join-request:{self.task_name}:{user_id}",
+            event_payload,
+        )
         return True
 
-    async def get_user_report_label(self, user_id):
-        with contextlib.suppress(Exception):
-            user = await self.app.get_entity(user_id)
-            return user_report_label(user_id, user)
+    async def get_user_identity(self, user_id, user=None):
+        if user is None:
+            with contextlib.suppress(Exception):
+                user = await self.app.get_entity(user_id)
+        username = getattr(user, "username", "") or ""
+        return user_report_label(user_id, user), {"user_id": user_id, "username": username}
 
-        return user_report_label(user_id)
+    async def pending_request_users(self, chat_peer):
+        """Return requester entities while Telegram still exposes usernames."""
+        peer = await self.resolve_peer(peer_id(chat_peer))
+        if peer is None:
+            peer = self.target_input_peer
+        if peer is None:
+            return {}
+        try:
+            result = await self.app(
+                functions.messages.GetChatInviteImportersRequest(
+                    peer=peer,
+                    requested=True,
+                    offset_date=None,
+                    offset_user=types.InputUserEmpty(),
+                    limit=100,
+                )
+            )
+            return {user.id: user for user in getattr(result, "users", [])}
+        except Exception:
+            logger.exception("[%s] Не удалось получить данные ожидающих заявок", self.task_name)
+            return {}
 
     async def handle_raw_update(self, update):
         if not self.is_running:
@@ -507,10 +520,11 @@ class AutoApproveWorker:
         if peer_id(chat_peer) != self.target_channel_id:
             return
 
+        pending_users = await self.pending_request_users(chat_peer)
         for user_id in requester_ids:
-            user_label = await self.get_user_report_label(user_id)
+            user_label, event_payload = await self.get_user_identity(user_id, pending_users.get(user_id))
 
-            if await self.enqueue_request(chat_peer, user_id, user_label):
+            if await self.enqueue_request(chat_peer, user_id, user_label, event_payload):
                 await self.report(
                     "Новая заявка\n"
                     f"Пользователь: {user_label}\n"
@@ -558,49 +572,6 @@ class AutoApproveWorker:
             binding_store.queue_manual(user_id, "legacy_message_error", self.task_name)
             return "ошибка отправки, передано вручную"
 
-    async def send_scheduled_message(self, user_id, user_label, initial_delay):
-        """Send the welcome message later without delaying join-request approval."""
-        try:
-            await asyncio.sleep(initial_delay)
-
-            async with self.message_send_lock:
-                if self.last_message_time is not None:
-                    elapsed = (datetime.now() - self.last_message_time).total_seconds()
-                    minimum_gap = random.randint(
-                        self.message_gap_min_seconds,
-                        self.message_gap_max_seconds,
-                    )
-                    await asyncio.sleep(max(0, minimum_gap - elapsed))
-
-                status = await self.send_third_from_bound_account(user_id, user_label)
-                self.last_message_time = datetime.now()
-
-            await self.report(
-                "Сообщение отправлено\n"
-                f"Пользователь: {user_label}\n"
-                f"Статус: {status}"
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception(
-                "[%s] Не удалось отправить запланированное сообщение пользователю %s",
-                self.task_name,
-                user_id,
-            )
-
-    def schedule_message(self, user_id, user_label):
-        initial_delay = random.randint(
-            self.message_delay_min_seconds,
-            self.message_delay_max_seconds,
-        )
-        task = asyncio.create_task(
-            self.send_scheduled_message(user_id, user_label, initial_delay)
-        )
-        self.message_tasks.add(task)
-        task.add_done_callback(self.message_tasks.discard)
-        return initial_delay
-
     async def scan_pending_requests(self, is_startup=False):
         count = 0
 
@@ -615,11 +586,12 @@ class AutoApproveWorker:
                 )
             )
 
+            pending_users = {user.id: user for user in getattr(result, "users", [])}
             for importer in result.importers:
                 user_id = importer.user_id
-                user_label = await self.get_user_report_label(user_id)
+                user_label, event_payload = await self.get_user_identity(user_id, pending_users.get(user_id))
 
-                if await self.enqueue_request(self.target_input_peer, user_id, user_label):
+                if await self.enqueue_request(self.target_input_peer, user_id, user_label, event_payload):
                     count += 1
         except Exception:
             logger.exception("[%s] Ошибка при сканировании заявок", self.task_name)
@@ -647,9 +619,10 @@ class AutoApproveWorker:
             chat_peer = None
             user_id = None
             user_label = None
+            event_payload = None
 
             try:
-                chat_peer, user_id, user_label = await asyncio.wait_for(
+                chat_peer, user_id, user_label, event_payload = await asyncio.wait_for(
                     self.request_queue.get(),
                     timeout=5,
                 )
@@ -657,6 +630,27 @@ class AutoApproveWorker:
                 continue
 
             try:
+                now = datetime.now()
+
+                if self.last_approval_time is None:
+                    wait_time = random.randint(
+                        self.first_min_seconds,
+                        self.first_max_seconds,
+                    )
+                else:
+                    elapsed = (now - self.last_approval_time).total_seconds()
+                    gap = random.randint(self.gap_min_seconds, self.gap_max_seconds)
+                    wait_time = max(0, int(gap - elapsed))
+
+                if wait_time > 0:
+                    minutes = max(1, int(wait_time // 60))
+                    await self.report(
+                        "Заявка в очереди\n"
+                        f"Пользователь: {user_label}\n"
+                        f"Ожидание: {minutes} мин."
+                    )
+                    await asyncio.sleep(wait_time)
+
                 try:
                     await self.approve_join_request(chat_peer, user_id)
                 except RPCError as exc:
@@ -669,15 +663,23 @@ class AutoApproveWorker:
                         user_id,
                     )
 
+                self.last_approval_time = datetime.now()
                 self.daily_count += 1
                 self.processed_users.add(user_id)
-                message_delay = self.schedule_message(user_id, user_label)
+                await record_event(
+                    self.task_name,
+                    "join_approved",
+                    f"join-approved:{self.task_name}:{user_id}",
+                    event_payload or {"user_id": user_id},
+                )
+
+                message_status = await self.send_third_from_bound_account(user_id, user_label)
 
                 await self.report(
                     "Заявка одобрена\n"
                     f"Пользователь: {user_label}\n"
                     "Статус: принят в канал\n"
-                    f"Сообщение запланировано через {message_delay} сек."
+                    f"Сообщение: {message_status}"
                 )
 
             except Exception:
@@ -742,15 +744,9 @@ class AutoApproveWorker:
         for task in self.background_tasks:
             task.cancel()
 
-        for task in tuple(self.message_tasks):
-            task.cancel()
-
         if self.background_tasks:
             await asyncio.gather(*self.background_tasks, return_exceptions=True)
 
         self.background_tasks.clear()
-        if self.message_tasks:
-            await asyncio.gather(*self.message_tasks, return_exceptions=True)
-        self.message_tasks.clear()
         with contextlib.suppress(Exception):
             await self.app.disconnect()

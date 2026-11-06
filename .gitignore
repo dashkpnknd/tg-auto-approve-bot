@@ -28,3 +28,8 @@ profiles/
 .venv/
 node_modules/
 ._*
+config.py
+accounts.json
+campaigns.json
+report_channel.txt
+*.log

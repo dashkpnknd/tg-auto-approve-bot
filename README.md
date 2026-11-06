@@ -1,0 +1,12 @@
+# Telegram Auto Approve Bot
+
+Служба обрабатывает заявки в каналы Telegram и запускает связанные кампании сообщений. Рабочая точка входа — `interface_botapi.py`; задачи одобрения находятся в `approvedApplications.py`, кампании — в `campaign_engine.py`.
+
+## Запуск
+
+1. Установите зависимости: `pip install -r requirements.txt`.
+2. Создайте `config.py` на основе `config.example.py` и задайте переменные для бота и Telegram API.
+3. При необходимости задайте `.env` и создайте `campaigns.json` по примеру `campaigns.example.json`.
+4. Запустите `python interface_botapi.py`.
+
+Файлы `config.py`, `.env`, аккаунты, сессии, базы, журналы и действующие кампании не публикуются.

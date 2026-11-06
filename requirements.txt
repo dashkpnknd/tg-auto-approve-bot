@@ -1,0 +1,5 @@
+aiogram==3.29.0
+Telethon==1.44.0
+qrcode==8.2
+PySocks==1.7.1
+Pillow==12.3.0

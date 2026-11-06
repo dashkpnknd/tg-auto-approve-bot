@@ -742,9 +742,9 @@ async def process_wizard(message: Message):
         temp_data[user_id]["messages"] = messages
         user_states[user_id] = "WAIT_PAUSES"
         await message.answer(
-            "Шаг 6\nУкажите паузы для сообщений в секундах\n"
-            "Формат: 30-600|1800\n"
-            "задержка сообщения после одобрения | минимальный интервал между сообщениями\n"
+            "Шаг 6\nУкажите паузы в минутах\n"
+            "Формат: 3-10|25-40\n"
+            "первая задержка | интервал между одобрениями\n"
             "Или отправьте: по умолчанию"
         )
 
@@ -753,25 +753,24 @@ async def process_wizard(message: Message):
 
         if normalized in ["default", "поумолчанию", "по_умолчанию", "стандарт", ""]:
             temp_data[user_id]["pauses"] = {
-                "message_delay_min_seconds": 30,
-                "message_delay_max_seconds": 600,
-                "message_gap_min_seconds": 1800,
-                "message_gap_max_seconds": 1800,
+                "first_min": 3,
+                "first_max": 10,
+                "gap_min": 25,
+                "gap_max": 40,
             }
         else:
             try:
-                delay_part, gap_part = normalized.split("|", 1)
-                delay_min, delay_max = delay_part.split("-", 1)
+                first_part, gap_part = normalized.split("|", 1)
+                first_min, first_max = first_part.split("-", 1)
+                gap_min, gap_max = gap_part.split("-", 1)
                 temp_data[user_id]["pauses"] = {
-                    "message_delay_min_seconds": int(delay_min),
-                    "message_delay_max_seconds": int(delay_max),
-                    "message_gap_min_seconds": int(gap_part),
-                    "message_gap_max_seconds": int(gap_part),
+                    "first_min": int(first_min),
+                    "first_max": int(first_max),
+                    "gap_min": int(gap_min),
+                    "gap_max": int(gap_max),
                 }
-                if min(temp_data[user_id]["pauses"].values()) < 0:
-                    raise ValueError
             except Exception:
-                await message.answer("Неверный формат. Пример: 30-600|1800 или по умолчанию.")
+                await message.answer("Неверный формат. Пример: 3-10|25-40 или по умолчанию.")
                 return
 
         user_states[user_id] = "WAIT_PHOTO"
@@ -1341,19 +1340,22 @@ async def handle_callback(callback: CallbackQuery):
 
         status = "РАБОТАЕТ" if task_name in active_tasks else "ОСТАНОВЛЕНА"
         session_name = config.get("session_file", task_name)
-        pauses = config.get("pauses") or {}
+        pauses = config.get("pauses") or {
+            "first_min": 3,
+            "first_max": 10,
+            "gap_min": 25,
+            "gap_max": 40,
+        }
         pauses_text = (
-            f"{pauses.get('message_delay_min_seconds', 30)}-"
-            f"{pauses.get('message_delay_max_seconds', 600)} сек. после одобрения; "
-            f"не чаще {pauses.get('message_gap_min_seconds', 1800)} сек."
+            f"{pauses.get('first_min', 3)}-{pauses.get('first_max', 10)}|"
+            f"{pauses.get('gap_min', 25)}-{pauses.get('gap_max', 40)}"
         )
 
         info = (
             f"Задача: {task_name}\n"
             f"Статус: {status}\n"
             f"Аккаунт: {session_name}\n"
-            "Одобрение: сразу\n"
-            f"Сообщения: {pauses_text}\n"
+            f"Паузы: {pauses_text}\n"
             f"2-е сообщение: {'настроено' if config.get('second_messages') else 'не настроено'}\n"
             f"3-е сообщение: {'настроено' if config.get('messages') else 'не настроено'}"
         )

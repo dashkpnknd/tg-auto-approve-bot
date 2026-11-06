@@ -20,6 +20,7 @@ from telethon.errors import FloodWaitError, RPCError
 from telethon.extensions import html
 from telethon.sessions import StringSession
 
+from analytics_events import record_event
 from config_local import API_HASH, API_ID
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,29 @@ class CampaignStore:
             db.execute("INSERT OR IGNORE INTO bindings(campaign_id,user_id,account_id,source_message_id,created_at) VALUES(?,?,?,?,?)", (campaign_id, user_id, account_id, message_id, datetime.utcnow().isoformat()))
             return db.execute("SELECT * FROM bindings WHERE campaign_id=? AND user_id=?", (campaign_id, user_id)).fetchone()
 
+    def bind_reply_to_sender(self, campaign_id, user_id, account_id, message_id):
+        """Prefer a real incoming reply over a temporary fallback binding.
+
+        A join request can be received just before its private reply is handled.
+        Such a request creates a binding without a source message and assigns the
+        fallback sender.  Until either follow-up has been sent, the account that
+        actually receives the client's reply is authoritative.
+        """
+        with self.lock, self.connect() as db:
+            updated = db.execute(
+                """UPDATE bindings
+                   SET account_id=?, source_message_id=?
+                   WHERE campaign_id=? AND user_id=?
+                     AND source_message_id IS NULL
+                     AND second_sent_at IS NULL AND third_sent_at IS NULL""",
+                (account_id, message_id, campaign_id, user_id),
+            ).rowcount
+            binding = db.execute(
+                "SELECT * FROM bindings WHERE campaign_id=? AND user_id=?",
+                (campaign_id, user_id),
+            ).fetchone()
+            return binding, updated == 1
+
     def mark_once(self, campaign_id, user_id, stage):
         column = "second_sent_at" if stage == 2 else "third_sent_at"
         with self.lock, self.connect() as db:
@@ -143,6 +167,12 @@ async def send_campaign_message(client, chat_id, content):
         if content.get("html"):
             return await client.send_message(chat_id, text, formatting_entities=entities)
     return await client.send_message(chat_id, content)
+
+
+def campaign_message_label(content):
+    """Stable human-readable label for conversion analytics."""
+    raw = content.get("html", "") if isinstance(content, dict) else str(content)
+    return " ".join(raw.split())[:600]
 
 
 class CampaignWorker:
@@ -224,10 +254,20 @@ class CampaignWorker:
             reply_max = max(0, int(pauses.get("reply_max", 3)))
             await asyncio.sleep(random.randint(*sorted((reply_min, reply_max))) * 60)
             dialog_lock = await self.wait_for_new_dialog(account_id, user_id)
-            await send_campaign_message(self.senders[account_id], user_id, random.choice(messages))
+            message = random.choice(messages)
+            await send_campaign_message(self.senders[account_id], user_id, message)
             with contextlib.suppress(Exception):
                 await self.senders[account_id].send_read_acknowledge(peer or user_id)
             if store.mark_once(self.id, user_id, 2):
+                await record_event(
+                    self.data.get("name", self.id), "second_message_sent", f"second-message:{self.id}:{user_id}",
+                    {
+                        "user_id": user_id,
+                        "username": getattr(peer, "username", "") if peer else "",
+                        "message_text": campaign_message_label(message),
+                        "account": account.get("name", account_id),
+                    },
+                )
                 await self.report(f"Ответ обработан\nКлиент: {label or user_id}\n2-е сообщение: отправлено с «{account.get('name', account_id)}»")
         except Exception as exc:
             store.queue(self.id, user_id, "second_message_error", str(exc)[:300])
@@ -247,6 +287,16 @@ class CampaignWorker:
             user_id = event.chat_id
             binding = store.bind(self.id, user_id, account_id, event.message.id)
             if binding["account_id"] != account_id:
+                binding, rebound = store.bind_reply_to_sender(
+                    self.id, user_id, account_id, event.message.id
+                )
+                if rebound:
+                    await self.report(
+                        f"Ответ привязан к аккаунту «{self.accounts[account_id].get('name', account_id)}»\n"
+                        f"Клиент: {getattr(chat, 'first_name', '')} ({user_id})"
+                    )
+                    await self.ensure_second(user_id, account_id, getattr(chat, "first_name", ""), chat)
+                    return
                 store.queue(self.id, user_id, "multiple_sender_accounts", f"{binding['account_id']}, {account_id}")
                 await self.report(f"Ручная очередь\nКлиент: {getattr(chat, 'first_name', '')} ({user_id})\nПричина: ответ найден в нескольких аккаунтах")
                 return
@@ -258,6 +308,7 @@ class CampaignWorker:
             return
         self.pending.add(user_id)
         await self.queue.put((peer, user_id))
+        await record_event(self.data.get("name", self.id), "join_request", f"join-request:{self.id}:{user_id}")
 
     async def raw_handler(self, update):
         if not self.running:
@@ -325,7 +376,16 @@ class CampaignWorker:
             await send_campaign_message(sender, user_id, random.choice(messages))
             with contextlib.suppress(Exception):
                 await sender.send_read_acknowledge(user_id)
-            return f"отправлено с «{account.get('name', account_id)}»" if store.mark_once(self.id, user_id, 3) else "не отправлено: уже было отправлено"
+            if store.mark_once(self.id, user_id, 3):
+                username = ""
+                with contextlib.suppress(Exception):
+                    username = getattr(await sender.get_entity(user_id), "username", "") or ""
+                await record_event(
+                    self.data.get("name", self.id), "third_message_sent", f"third-message:{self.id}:{user_id}",
+                    {"user_id": user_id, "username": username},
+                )
+                return f"отправлено с «{account.get('name', account_id)}»"
+            return "не отправлено: уже было отправлено"
         except Exception as exc:
             store.queue(self.id, user_id, "third_message_error", str(exc)[:300])
             return "ошибка отправки, передано вручную"
@@ -345,6 +405,7 @@ class CampaignWorker:
                 if wait: await asyncio.sleep(wait)
                 await self.approve(peer, user_id)
                 self.last_approval = datetime.utcnow(); self.processed.add(user_id)
+                await record_event(self.data.get("name", self.id), "join_approved", f"join-approved:{self.id}:{user_id}")
                 await self.report(f"Заявка одобрена\nКлиент: {user_id}\n3-е сообщение: {await self.send_third(user_id)}")
             except RPCError as exc:
                 store.queue(self.id, user_id, "approval_error", str(exc)[:300])
